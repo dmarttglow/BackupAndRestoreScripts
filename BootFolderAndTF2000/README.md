@@ -43,6 +43,30 @@ fbStartUpdate(
 
 TwinCAT keeps running until the package has been fully validated. If the stick is missing or the package is bad, nothing is stopped and the machine keeps running. Once validation passes, the PLC and HMI go down and the IPC reboots about 10 s after the update finishes.
 
+## Optional arguments
+
+Both launchers pass anything after them straight to their script, e.g. `Apply-Update.bat -NoReboot` or `Create-UpdatePackage.bat -Destination E:\`. The PLC trigger runs `Apply-Update.bat` with no arguments.
+
+**`Apply-Update.bat` (machine)**
+
+| Argument | What it does |
+|---|---|
+| `-AllowVersionMismatch` | Applies the package even if the XAR / TF2000 versions differ from this machine. The mismatch is still logged. Manual use only. |
+| `-NoReboot` | Doesn't reboot at the end. Restarts the HMI Server and puts TwinCAT back into Run mode instead. |
+| `-PackagePath <folder>` | Uses this package folder instead of searching all drives for `\TwinCAT_Update`. Needed if more than one drive holds a package. |
+| `-ConfigPath <file>` | Uses a different config file instead of `Config.ps1`. |
+
+**`Create-UpdatePackage.bat` (bench)**
+
+| Argument | What it does |
+|---|---|
+| `-Destination <drive or folder>` | Where to build the package, e.g. `E:\`. Default: the USB drive the script runs from, or the only USB drive present. |
+| `-NoStop` | Copies without stopping TwinCAT / the HMI Server first. Not recommended: files can change mid-copy. |
+| `-LeaveStopped` | Leaves TwinCAT in Config mode and the HMI Server stopped afterwards. |
+| `-ConfigPath <file>` | Uses a different config file instead of `Config.ps1`. |
+
+Set the environment variable `NOPAUSE=1` to stop `Create-UpdatePackage.bat` waiting for a keypress at the end (useful when calling it from another script).
+
 ## Result and logs (machine)
 
 - `C:\TwinCAT_UpdateBackups\last_update_status.txt`: `SUCCESS` / `FAILED - nothing changed` / `FAILED - previous version restored` / `FAILED - ROLLBACK FAILED`
