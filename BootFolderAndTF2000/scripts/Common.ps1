@@ -284,12 +284,72 @@ function Get-TwinCATInfo {
     [pscustomobject]$info
 }
 
-# "3.1.4024.56" -> "3.1.4024"
-function Get-TwinCATBuild {
+# "3, 1, 4026, 27" / "3.1.4026.27 (abc)" -> "3.1.4026.27"
+function Format-Version {
     param([string]$Version)
     if (-not $Version) { return $null }
-    $parts = (($Version -replace '\s', '' -replace ',', '.') -replace '[^0-9.].*$', '') -split '\.'
-    ($parts | Select-Object -First 3) -join '.'
+    $v = (($Version -replace '\s', '' -replace ',', '.') -replace '[^0-9.].*$', '').Trim('.')
+    if ($v) { $v } else { $null }
+}
+
+# ProductVersion of the exe a Windows service runs, or $null.
+function Get-ServiceExeVersion {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    try {
+        $svc = Get-WmiObject -Class Win32_Service -Filter "Name='$Name'" -ErrorAction Stop
+        if (-not $svc -or -not $svc.PathName) { return $null }
+        $exe = if ($svc.PathName -match '^"([^"]+)"') { $Matches[1] } else { ($svc.PathName -split '\s+')[0] }
+        if (-not (Test-Path -LiteralPath $exe)) { return $null }
+        $vi = (Get-Item -LiteralPath $exe).VersionInfo
+        $v = Format-Version $vi.ProductVersion
+        if (-not $v) { $v = Format-Version $vi.FileVersion }
+        $v
+    } catch { $null }
+}
+
+# Installed TwinCAT runtime (XAR) and TF2000 HMI Server versions.
+#  XAR:    registry TcVersion (fallback: TcSysSrv exe ProductVersion)
+#  TF2000: ProductVersion of the exe the HMI Server service actually runs
+function Get-InstalledVersions {
+    param([Parameter(Mandatory = $true)][string]$HmiServiceName)
+    [ordered]@{
+        TwinCAT_XAR       = Format-Version (Get-TwinCATInfo).Version
+        TF2000_HMI_Server = Get-ServiceExeVersion $HmiServiceName
+    }
+}
+
+function Write-VersionFile {
+    param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)]$Versions)
+    [ordered]@{
+        ComputerName = $env:COMPUTERNAME
+        CreatedLocal = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+        Versions     = $Versions
+    } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Path -Encoding UTF8
+}
+
+# Returns the Versions table from a versions.json as a hashtable.
+function Read-VersionFile {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "Version file not found: $Path" }
+    $data = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+    if (-not $data.Versions) { throw "Version file '$Path' has no Versions section." }
+    $table = [ordered]@{}
+    foreach ($p in $data.Versions.PSObject.Properties) { $table[$p.Name] = [string]$p.Value }
+    $table
+}
+
+# Compares expected (package) versions with actual (this machine). Returns mismatches.
+function Compare-Versions {
+    param([Parameter(Mandatory = $true)]$Expected, [Parameter(Mandatory = $true)]$Actual)
+    $problems = New-Object System.Collections.Generic.List[string]
+    foreach ($name in @($Expected.Keys)) {
+        $want = Format-Version $Expected[$name]
+        $have = Format-Version $Actual[$name]
+        if (-not $want) { $problems.Add("${name}: not recorded in the package") }
+        elseif (-not $have) { $problems.Add("${name}: package has $want but the installed version could not be read on this machine") }
+        elseif ($want -ne $have) { $problems.Add("${name}: package $want, this machine $have") }
+    }
+    $problems.ToArray()
 }
 
 # Connects to the local TwinCAT system service through the .NET ADS API

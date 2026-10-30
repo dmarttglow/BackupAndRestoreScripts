@@ -72,6 +72,14 @@ try {
     Write-Log "TwinCAT version: $($tc.Version)   AMS Net ID: $($tc.AmsNetId)"
     Write-Log "Package folder:  $pkgFinal"
 
+    # --- Record installed versions (checked by Apply-Update on the machine) -------
+    $versions = Get-InstalledVersions -HmiServiceName $S.HmiServiceName
+    foreach ($k in $versions.Keys) {
+        if (-not $versions[$k]) { throw "Could not read the installed $k version on this bench system." }
+        Write-Log "Version $($k.PadRight(18)) $($versions[$k])"
+    }
+    Write-VersionFile -Path (Join-Path $pkgTemp 'versions.json') -Versions $versions
+
     # --- Resolve source folders -------------------------------------------------
     $entries = foreach ($item in $config.Items) {
         $src = Resolve-ItemFolder $item

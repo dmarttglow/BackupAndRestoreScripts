@@ -6,8 +6,9 @@
 .DESCRIPTION
     Nothing on the machine is touched until the package has been fully validated.
     1. Finds <drive>:\TwinCAT_Update\manifest.json on the attached drives.
-    2. Verifies every file in the package against its SHA-256 hash and checks the
-       TwinCAT build matches.
+    2. Checks the TwinCAT XAR and TF2000 HMI Server versions recorded in the package
+       (versions.json) exactly match this machine, and verifies every file in the
+       package against its SHA-256 hash.
     3. Switches TwinCAT to Config mode via ADS and stops the HMI Server service.
     4. Backs up the current Boot + HMI folders to C:\TwinCAT_UpdateBackups\<timestamp>.
     5. Mirrors the package folders into place and verifies every file.
@@ -28,7 +29,8 @@
     Do not reboot; restart the HMI Server and put TwinCAT back into Run mode instead.
 
 .PARAMETER AllowVersionMismatch
-    Apply even if the package was made on a different TwinCAT build.
+    Apply even if the XAR / TF2000 versions in the package differ from this machine
+    (manual use only - the mismatch is still logged).
 #>
 [CmdletBinding()]
 param(
@@ -108,17 +110,23 @@ try {
     Write-Log "  created $($manifest.CreatedLocal) on $($manifest.ComputerName), TwinCAT $($manifest.TwinCATVersion)"
     if ($manifest.Purpose -ne 'UpdatePackage') { throw "'$pkg' is not an update package (purpose: $($manifest.Purpose))." }
 
-    $tc = Get-TwinCATInfo
-    Write-Log "This machine: TwinCAT $($tc.Version), AMS Net ID $($tc.AmsNetId)"
-    $pkgBuild = Get-TwinCATBuild $manifest.TwinCATVersion
-    $myBuild = Get-TwinCATBuild $tc.Version
-    if ($pkgBuild -and $myBuild -and $pkgBuild -ne $myBuild) {
-        $msg = "TwinCAT build mismatch: package $pkgBuild, machine $myBuild."
-        if ($S.RequireSameTwinCATBuild -and -not $AllowVersionMismatch) { throw "$msg Refusing to apply (see RequireSameTwinCATBuild in Config.ps1)." }
-        Write-Log -Level WARN "$msg Continuing anyway."
-    } elseif (-not $pkgBuild -or -not $myBuild) {
-        Write-Log -Level WARN 'Could not determine both TwinCAT versions - version check skipped.'
+    # Versions must match exactly: XAR and TF2000 on this machine vs. the bench that built the package.
+    $pkgVersions = Read-VersionFile (Join-Path $pkg 'versions.json')
+    $localVersions = Get-InstalledVersions -HmiServiceName $S.HmiServiceName
+    foreach ($k in $pkgVersions.Keys) {
+        Write-Log ("Version {0} package {1,-14} this machine {2}" -f $k.PadRight(18), $pkgVersions[$k], $(if ($localVersions[$k]) { $localVersions[$k] } else { '(unknown)' }))
     }
+    $mismatches = @(Compare-Versions -Expected $pkgVersions -Actual $localVersions)
+    if ($mismatches.Count) {
+        $mismatches | ForEach-Object { Write-Log -Level ERROR "  VERSION MISMATCH - $_" }
+        if (-not $AllowVersionMismatch) {
+            throw "Installed versions do not match the package ($($mismatches.Count) mismatch(es)). Nothing was changed."
+        }
+        Write-Log -Level WARN '-AllowVersionMismatch given: continuing despite the version mismatch.'
+    } else {
+        Write-Log -Level OK 'Installed XAR and TF2000 versions match the package'
+    }
+    Write-Log "This machine: AMS Net ID $((Get-TwinCATInfo).AmsNetId)"
 
     # Map package items -> target folders on this machine.
     $plan = foreach ($mi in $manifest.Items) {
@@ -170,6 +178,7 @@ try {
         [pscustomobject]@{ Name = $p.Name; Description = $p.Description; SourcePath = $p.Target; ExcludeFiles = @(); ExcludeDirs = @() }
     }
     $backupManifest = New-FolderSnapshot -Entries @($backupEntries) -Destination $backupDir -Purpose 'PreUpdateBackup'
+    Write-VersionFile -Path (Join-Path $backupDir 'versions.json') -Versions $localVersions
 
     try {
         foreach ($p in $plan) {

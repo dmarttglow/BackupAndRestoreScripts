@@ -15,10 +15,6 @@ $Settings = @{
     # How many old-version backups to keep on the machine (oldest are deleted).
     BackupsToKeep            = 5
 
-    # Refuse to apply a package built on a different TwinCAT build
-    # (e.g. 4024.x bench -> 4026.x machine). Strongly recommended.
-    RequireSameTwinCATBuild  = $true
-
     # Keep the machine's own PLC persistent data (*.bootdata) instead of
     # overwriting it with the bench's values. See README before changing.
     PreservePersistentData   = $true
