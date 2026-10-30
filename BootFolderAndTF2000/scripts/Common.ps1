@@ -6,18 +6,52 @@
 $script:LogFile = $null
 $script:AdsClient = $null
 $script:AdsAssembly = $null
+$script:ProgressShown = $false
+$script:ProgressLastDraw = [DateTime]::MinValue
+$script:SpinnerFrames = '|', '/', '-', '\'
 
 $AdsSystemServicePort = 10000
 
 # -----------------------------------------------------------------------------
-#  Logging / prerequisites
+#  Logging / console progress
 # -----------------------------------------------------------------------------
+
+# Draws a single status line that is overwritten in place on the console, so
+# long steps visibly keep moving. Console only - never written to the log.
+# Redraws at most 4x per second unless -Force. Silently does nothing without a console.
+function Write-ProgressLine {
+    param([Parameter(Mandatory = $true)][string]$Text, [switch]$Force)
+    $now = [DateTime]::UtcNow
+    if (-not $Force -and ($now - $script:ProgressLastDraw).TotalMilliseconds -lt 250) { return }
+    $script:ProgressLastDraw = $now
+    try {
+        $spin = $script:SpinnerFrames[[int](([long]($now.Ticks / 2500000)) % 4)]
+        $width = [Math]::Max(20, [Console]::WindowWidth - 1)
+        $line = "  $spin $Text"
+        if ($line.Length -gt $width) { $line = $line.Substring(0, $width) }
+        [Console]::Write("`r" + $line.PadRight($width))
+        $script:ProgressShown = $true
+    } catch { }
+}
+
+function Clear-ProgressLine {
+    if (-not $script:ProgressShown) { return }
+    try { [Console]::Write("`r" + (' ' * [Math]::Max(20, [Console]::WindowWidth - 1)) + "`r") } catch { }
+    $script:ProgressShown = $false
+}
+
+function Format-Elapsed {
+    param([Parameter(Mandatory = $true)][Diagnostics.Stopwatch]$Stopwatch)
+    $t = $Stopwatch.Elapsed
+    if ($t.TotalHours -ge 1) { '{0}:{1:mm}:{1:ss}' -f [int][Math]::Floor($t.TotalHours), $t } else { '{0:mm}:{0:ss}' -f $t }
+}
 
 function Write-Log {
     param(
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Message,
         [ValidateSet('INFO', 'STEP', 'OK', 'WARN', 'ERROR')][string]$Level = 'INFO'
     )
+    Clear-ProgressLine
     $line = '[{0}] [{1,-5}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message
     $color = switch ($Level) {
         'STEP'  { 'Cyan' }
@@ -143,20 +177,44 @@ function Get-FolderInventory {
         [Parameter(Mandatory = $true)][string]$Root,
         [string[]]$ExcludeFiles = @(),
         [string[]]$ExcludeDirs = @(),
-        [switch]$NoHash
+        [switch]$NoHash,
+        [string]$Activity = 'Hashing'
     )
     $rootFull = Get-NormalizedPath $Root
     if (-not (Test-Path -LiteralPath $rootFull -PathType Container)) { return @() }
-    $result = foreach ($f in Get-ChildItem -LiteralPath $rootFull -Recurse -Force -File -ErrorAction Stop) {
-        $rel = $f.FullName.Substring($rootFull.Length).TrimStart('\')
-        if (Test-PathExcluded -RelativePath $rel -ExcludeFiles $ExcludeFiles -ExcludeDirs $ExcludeDirs) { continue }
+    Write-ProgressLine -Force "Scanning $rootFull ..."
+    $files = @(Get-ChildItem -LiteralPath $rootFull -Recurse -Force -File -ErrorAction Stop | Where-Object {
+        -not (Test-PathExcluded -RelativePath $_.FullName.Substring($rootFull.Length).TrimStart('\') -ExcludeFiles $ExcludeFiles -ExcludeDirs $ExcludeDirs)
+    })
+    $totalBytes = [long]0
+    foreach ($f in $files) { $totalBytes += $f.Length }
+
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $doneBytes = [long]0
+    $i = 0
+    $result = foreach ($f in $files) {
+        $i++
+        if (-not $NoHash) {
+            $pct = if ($totalBytes) { [int](100 * $doneBytes / $totalBytes) } else { 100 }
+            Write-ProgressLine ("{0}: {1}/{2} files, {3:N1}/{4:N1} MB ({5}%)  {6}" -f $Activity, $i, $files.Count, ($doneBytes / 1MB), ($totalBytes / 1MB), $pct, (Format-Elapsed $sw))
+        }
         [pscustomobject][ordered]@{
-            Path   = $rel
+            Path   = $f.FullName.Substring($rootFull.Length).TrimStart('\')
             Size   = $f.Length
             Sha256 = $(if ($NoHash) { $null } else { Get-FileSha256 $f.FullName })
         }
+        $doneBytes += $f.Length
     }
+    Clear-ProgressLine
     @($result | Sort-Object Path)
+}
+
+# Quotes arguments for Start-Process (a trailing backslash would escape the closing quote).
+function Join-ProcessArguments {
+    param([string[]]$Arguments)
+    ($Arguments | ForEach-Object {
+        if ($_ -match '[\s"]') { '"' + ($_ -replace '(\\+)$', '$1$1' -replace '"', '\"') + '"' } else { $_ }
+    }) -join ' '
 }
 
 function Invoke-Robocopy {
@@ -166,7 +224,8 @@ function Invoke-Robocopy {
         [switch]$Mirror,
         [string[]]$ExcludeFiles = @(),
         [string[]]$ExcludeDirs = @(),
-        [Parameter(Mandatory = $true)][string]$LogPath
+        [Parameter(Mandatory = $true)][string]$LogPath,
+        [string]$Label = 'Copying'
     )
     # /IS /IT: always copy, even files that look identical (size + timestamp).
     # /XJ: never follow junctions. Excluded files are neither copied nor purged.
@@ -176,10 +235,24 @@ function Invoke-Robocopy {
     if ($ExcludeFiles.Count) { $rcArgs += '/XF'; $rcArgs += $ExcludeFiles }
     if ($ExcludeDirs.Count) { $rcArgs += '/XD'; $rcArgs += $ExcludeDirs }
 
-    & robocopy.exe @rcArgs | Out-Null
-    $code = $LASTEXITCODE
+    # Run as a child process so the console can show that the copy is still going.
+    # Its own console output (just a "Log File :" line with /UNILOG) is discarded.
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $rcOut = [IO.Path]::GetTempFileName()
+    try {
+        $p = Start-Process -FilePath robocopy.exe -ArgumentList (Join-ProcessArguments $rcArgs) -NoNewWindow -PassThru -RedirectStandardOutput $rcOut
+        $null = $p.Handle   # without this, ExitCode is empty after the process ends
+        while (-not $p.WaitForExit(250)) {
+            Write-ProgressLine "$Label ...  $(Format-Elapsed $sw) elapsed"
+        }
+        $p.WaitForExit()
+    } finally {
+        Clear-ProgressLine
+        Remove-Item -LiteralPath $rcOut -Force -ErrorAction SilentlyContinue
+    }
+    $code = $p.ExitCode
     if ($code -ge 8) { throw "robocopy failed (exit code $code) copying '$Source' -> '$Destination'. See $LogPath" }
-    Write-Log "robocopy exit code $code"
+    Write-Log "robocopy finished in $(Format-Elapsed $sw) (exit code $code)"
 }
 
 # Copies each entry's SourcePath into <Destination>\<Name>, then hashes the copy
@@ -196,11 +269,11 @@ function New-FolderSnapshot {
     $manifestItems = foreach ($e in $Entries) {
         $target = Join-Path $Destination $e.Name
         Write-Log -Level STEP "[$($e.Name)] copying '$($e.SourcePath)' -> '$target'"
-        Invoke-Robocopy -Source $e.SourcePath -Destination $target -ExcludeFiles $e.ExcludeFiles -ExcludeDirs $e.ExcludeDirs -LogPath $rcLog
+        Invoke-Robocopy -Source $e.SourcePath -Destination $target -ExcludeFiles $e.ExcludeFiles -ExcludeDirs $e.ExcludeDirs -LogPath $rcLog -Label "Copying [$($e.Name)]"
         if (-not (Test-Path -LiteralPath $target)) { New-Item -ItemType Directory -Path $target -Force | Out-Null }
 
         $srcCount = @(Get-FolderInventory -Root $e.SourcePath -ExcludeFiles $e.ExcludeFiles -ExcludeDirs $e.ExcludeDirs -NoHash).Count
-        $files = @(Get-FolderInventory -Root $target -ExcludeFiles $e.ExcludeFiles -ExcludeDirs $e.ExcludeDirs)
+        $files = @(Get-FolderInventory -Root $target -ExcludeFiles $e.ExcludeFiles -ExcludeDirs $e.ExcludeDirs -Activity "Hashing [$($e.Name)]")
         if ($files.Count -ne $srcCount) {
             throw "[$($e.Name)] file count mismatch after copy: source has $srcCount, copy has $($files.Count)."
         }
@@ -246,13 +319,28 @@ function Read-Manifest {
 
 # Compares the files under Root with a manifest item. Returns a list of problems.
 function Compare-FolderToManifest {
-    param([Parameter(Mandatory = $true)][string]$Root, [Parameter(Mandatory = $true)]$ManifestItem)
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)]$ManifestItem,
+        [string]$Activity = 'Verifying'
+    )
     $problems = New-Object System.Collections.Generic.List[string]
-    foreach ($f in @($ManifestItem.Files | Where-Object { $_ })) {
+    $files = @($ManifestItem.Files | Where-Object { $_ })
+    $totalBytes = [long]0
+    foreach ($f in $files) { $totalBytes += [long]$f.Size }
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $doneBytes = [long]0
+    $i = 0
+    foreach ($f in $files) {
+        $i++
+        $pct = if ($totalBytes) { [int](100 * $doneBytes / $totalBytes) } else { 100 }
+        Write-ProgressLine ("{0}: {1}/{2} files, {3:N1}/{4:N1} MB ({5}%)  {6}" -f $Activity, $i, $files.Count, ($doneBytes / 1MB), ($totalBytes / 1MB), $pct, (Format-Elapsed $sw))
+        $doneBytes += [long]$f.Size
         $p = Join-Path $Root $f.Path
         if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { $problems.Add("missing: $($f.Path)"); continue }
         if ((Get-FileSha256 $p) -ne $f.Sha256) { $problems.Add("content differs: $($f.Path)") }
     }
+    Clear-ProgressLine
     $problems.ToArray()   # callers wrap in @() to get a count
 }
 
@@ -361,7 +449,13 @@ function Initialize-Ads {
 
     $roots = @($env:TWINCAT3DIR, 'C:\TwinCAT', "${env:ProgramFiles(x86)}\Beckhoff\TwinCAT", "$env:ProgramFiles\Beckhoff") |
         Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -Unique
-    $files = @(foreach ($r in $roots) { Get-ChildItem -LiteralPath $r -Recurse -Filter 'TwinCAT.Ads.dll' -ErrorAction SilentlyContinue })
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $files = @(foreach ($r in $roots) {
+        Get-ChildItem -LiteralPath $r -Recurse -Filter 'TwinCAT.Ads.dll' -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-ProgressLine "Looking for TwinCAT.Ads.dll in $r ...  $(Format-Elapsed $sw)"; $_ }
+        Write-ProgressLine -Force "Looking for TwinCAT.Ads.dll in $r ...  $(Format-Elapsed $sw)"
+    })
+    Clear-ProgressLine
     $seen = @{}
     $dlls = @($files |
         ForEach-Object {
@@ -426,13 +520,15 @@ function Set-TwinCATMode {
             $lastError = $_.Exception.Message
             Write-Log "ADS request '$req' not accepted: $lastError"
         }
-        $deadline = (Get-Date).AddSeconds($TimeoutSec)
+        $sw = [Diagnostics.Stopwatch]::StartNew()
         do {
-            Start-Sleep -Milliseconds 500
+            Start-Sleep -Milliseconds 250
             try { $current = Get-TwinCATState } catch { $current = 'unreachable' }   # ADS drops briefly while switching
-            if ($current -eq $Mode) { Write-Log -Level OK "TwinCAT is in $Mode mode"; return }
-        } while ((Get-Date) -lt $deadline)
+            if ($current -eq $Mode) { Write-Log -Level OK "TwinCAT is in $Mode mode (took $(Format-Elapsed $sw))"; return }
+            Write-ProgressLine ("Waiting for TwinCAT {0} mode ...  state: {1}  {2:N0}/{3} s" -f $Mode, $current, $sw.Elapsed.TotalSeconds, $TimeoutSec)
+        } while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec)
     }
+    Clear-ProgressLine
     throw "TwinCAT did not reach $Mode mode within the timeout (state: $current). $lastError"
 }
 
@@ -446,6 +542,19 @@ function Close-Ads {
 #  Windows services
 # -----------------------------------------------------------------------------
 
+# Waits for a service to reach a status, showing progress. Returns $true if it got there.
+function Wait-ServiceStatus {
+    param([Parameter(Mandatory = $true)][ServiceProcess.ServiceController]$Service, [string]$Status, [int]$TimeoutSec)
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+        $Service.Refresh()
+        if ("$($Service.Status)" -eq $Status) { Clear-ProgressLine; return $true }
+        if ($sw.Elapsed.TotalSeconds -ge $TimeoutSec) { Clear-ProgressLine; return $false }
+        Write-ProgressLine ("Waiting for service '{0}' to be {1} ...  now: {2}  {3:N0}/{4} s" -f $Service.Name, $Status, $Service.Status, $sw.Elapsed.TotalSeconds, $TimeoutSec)
+        Start-Sleep -Milliseconds 250
+    }
+}
+
 # Stops a service (and its running dependents). Returns names to start again later.
 function Stop-ServiceWithTimeout {
     param([Parameter(Mandatory = $true)][string]$Name, [int]$TimeoutSec = 60)
@@ -456,15 +565,13 @@ function Stop-ServiceWithTimeout {
     $restart = @($Name) + @($svc.DependentServices | Where-Object { $_.Status -ne 'Stopped' } | ForEach-Object { $_.Name })
     Write-Log -Level STEP "Stopping service '$Name' ($($svc.DisplayName))..."
     $svc.Stop()
-    try { $svc.WaitForStatus('Stopped', [TimeSpan]::FromSeconds($TimeoutSec)) }
-    catch {
+    if (-not (Wait-ServiceStatus -Service $svc -Status 'Stopped' -TimeoutSec $TimeoutSec)) {
         # Last resort: kill the service process.
         $wmi = Get-WmiObject -Class Win32_Service -Filter "Name='$Name'"
-        if ($wmi -and $wmi.ProcessId) {
-            Write-Log -Level WARN "Service '$Name' did not stop within $TimeoutSec s - killing PID $($wmi.ProcessId)"
-            Stop-Process -Id $wmi.ProcessId -Force -ErrorAction SilentlyContinue
-            $svc.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(15))
-        } else { throw }
+        if (-not $wmi -or -not $wmi.ProcessId) { throw "Service '$Name' did not stop within $TimeoutSec s." }
+        Write-Log -Level WARN "Service '$Name' did not stop within $TimeoutSec s - killing PID $($wmi.ProcessId)"
+        Stop-Process -Id $wmi.ProcessId -Force -ErrorAction SilentlyContinue
+        if (-not (Wait-ServiceStatus -Service $svc -Status 'Stopped' -TimeoutSec 15)) { throw "Service '$Name' could not be stopped." }
     }
     Write-Log -Level OK "Service '$Name' stopped"
     $restart
@@ -477,7 +584,7 @@ function Start-ServiceSafe {
         if ($svc.Status -ne 'Running') {
             Write-Log -Level STEP "Starting service '$Name'..."
             $svc.Start()
-            $svc.WaitForStatus('Running', [TimeSpan]::FromSeconds($TimeoutSec))
+            if (-not (Wait-ServiceStatus -Service $svc -Status 'Running' -TimeoutSec $TimeoutSec)) { throw "did not start within $TimeoutSec s" }
         }
         Write-Log -Level OK "Service '$Name' running"
         $true

@@ -148,7 +148,7 @@ try {
 
     Write-Log -Level STEP 'Verifying package integrity (SHA-256)...'
     foreach ($p in $plan) {
-        $problems = @(Compare-FolderToManifest -Root (Join-Path $pkg $p.Name) -ManifestItem $p.Manifest)
+        $problems = @(Compare-FolderToManifest -Root (Join-Path $pkg $p.Name) -ManifestItem $p.Manifest -Activity "Checking package [$($p.Name)]")
         if ($problems.Count) {
             $problems | Select-Object -First 20 | ForEach-Object { Write-Log -Level ERROR "  [$($p.Name)] $_" }
             throw "Package is corrupt or incomplete ($($problems.Count) problem(s) in '$($p.Name)')."
@@ -184,12 +184,12 @@ try {
         foreach ($p in $plan) {
             Write-Log -Level STEP "[$($p.Name)] replacing $($p.Target)"
             $machineTouched = $true
-            Invoke-Robocopy -Source (Join-Path $pkg $p.Name) -Destination $p.Target -Mirror `
+            Invoke-Robocopy -Source (Join-Path $pkg $p.Name) -Destination $p.Target -Mirror -Label "Installing [$($p.Name)]" `
                 -ExcludeFiles $p.ExcludeFiles -ExcludeDirs $p.ExcludeDirs -LogPath (Join-Path $backupDir 'apply-robocopy.log')
         }
         Write-Log -Level STEP 'Verifying installed files (SHA-256)...'
         foreach ($p in $plan) {
-            $problems = @(Compare-FolderToManifest -Root $p.Target -ManifestItem $p.Manifest)
+            $problems = @(Compare-FolderToManifest -Root $p.Target -ManifestItem $p.Manifest -Activity "Verifying installed [$($p.Name)]")
             if ($problems.Count) {
                 $problems | Select-Object -First 20 | ForEach-Object { Write-Log -Level ERROR "  [$($p.Name)] $_" }
                 throw "Verification failed for '$($p.Name)' ($($problems.Count) problem(s))."
@@ -204,8 +204,8 @@ try {
         foreach ($bi in $backupManifest.Items) {
             $p = $plan | Where-Object { $_.Name -eq $bi.Name }
             try {
-                Invoke-Robocopy -Source (Join-Path $backupDir $bi.Name) -Destination $p.Target -Mirror -LogPath (Join-Path $backupDir 'rollback-robocopy.log')
-                $problems = @(Compare-FolderToManifest -Root $p.Target -ManifestItem $bi)
+                Invoke-Robocopy -Source (Join-Path $backupDir $bi.Name) -Destination $p.Target -Mirror -Label "Rolling back [$($bi.Name)]" -LogPath (Join-Path $backupDir 'rollback-robocopy.log')
+                $problems = @(Compare-FolderToManifest -Root $p.Target -ManifestItem $bi -Activity "Verifying rollback [$($bi.Name)]")
                 if ($problems.Count) { throw "$($problems.Count) file(s) differ after rollback" }
                 Write-Log -Level OK "[$($bi.Name)] rolled back"
             } catch {
@@ -254,6 +254,11 @@ finally {
             } elseif ($S.RebootAfterApply -and -not $NoReboot) {
                 Write-Log -Level STEP "Rebooting in $($S.RebootDelaySeconds) s..."
                 & shutdown.exe /r /f /t $S.RebootDelaySeconds /d p:4:1 /c "TwinCAT update: $statusText"
+                for ($s = [int]$S.RebootDelaySeconds; $s -gt 0; $s--) {
+                    Write-ProgressLine -Force "$statusText - controller restarts in $s s  (cancel: shutdown /a)"
+                    Start-Sleep -Seconds 1
+                }
+                Clear-ProgressLine
             } else {
                 foreach ($svc in $servicesToStart) { [void](Start-ServiceSafe -Name $svc -TimeoutSec $S.ServiceStopTimeoutSec) }
                 try { Set-TwinCATMode -Mode Run -TimeoutSec $S.AdsStateTimeoutSec }
