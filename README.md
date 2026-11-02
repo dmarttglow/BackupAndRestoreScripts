@@ -4,7 +4,7 @@ Scripts for backing up, moving and restoring software on Beckhoff TwinCAT 3 IPCs
 
 | Folder | What it's for |
 |---|---|
-| [`BootFolderAndTF2000`](BootFolderAndTF2000/README.md) | Copies the TwinCAT Boot folder (PLC + I/O config) and the TF2000 HMI Server data from a bench system to machine IPCs on a USB stick, with automatic backup and rollback. |
+| `BootFolderAndTF2000` ([Windows](BootFolderAndTF2000/Windows/README.md), [Linux](BootFolderAndTF2000/Linux/README.md)) | Copies the TwinCAT Boot folder (PLC + I/O config) and the TF2000 HMI Server data from a bench system to machine IPCs on a USB stick, with automatic backup and rollback. |
 
 ## BootFolderAndTF2000 in short
 
@@ -17,10 +17,13 @@ You build the software on a **bench system**, then put it on each **machine IPC*
    - checks every file, restores the backup automatically if anything fails, then reboots
 3. **Check the result** in `C:\TwinCAT_UpdateBackups\last_update_status.txt` on the machine, or in the log copied back to the stick under `TwinCAT_Update\Logs\`.
 
-Before the first use, check the paths in `BootFolderAndTF2000\Config.ps1`. Then copy the folder to a fixed local path on each machine (e.g. `C:\TwinCAT_UpdateTool\`). [BootFolderAndTF2000/README.md](BootFolderAndTF2000/README.md) covers the full setup, the PLC trigger code, optional arguments, logs and manual rollback.
+Before the first use, check the paths in `BootFolderAndTF2000\Windows\Config.ps1`. Then copy the folder to a fixed local path on each machine (e.g. `C:\TwinCAT_UpdateTool\`). [BootFolderAndTF2000/Windows/README.md](BootFolderAndTF2000/Windows/README.md) covers the full setup, the PLC trigger code, optional arguments, logs and manual rollback.
+
+The [Linux version](BootFolderAndTF2000/Linux/README.md) works the same way with `Create-UpdatePackage.sh` / `Apply-Update.sh` and `Config.sh`. The result file is `/var/lib/TwinCAT_UpdateBackups/last_update_status.txt`.
 
 ## Requirements
 
 - Windows IPCs with TwinCAT 3 installed. The scripts use the ADS DLL that comes with TwinCAT, so you don't need to install anything extra.
 - Windows PowerShell 3.0 or newer (built into Windows). The scripts need administrator rights. When the PLC starts them, they run as SYSTEM.
+- Linux IPCs (Beckhoff RT Linux / Debian with systemd): bash, `rsync` and an ADS command-line tool such as `adstool`. See the [Linux README](BootFolderAndTF2000/Linux/README.md).
 - The bench system and the machines should be the same IPC model, with the same TwinCAT and TF2000 versions.
