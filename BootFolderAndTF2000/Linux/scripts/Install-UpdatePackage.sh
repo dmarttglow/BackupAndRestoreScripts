@@ -5,7 +5,7 @@
 #  (NT_StartProcess) from an HMI button.
 #
 #  Nothing on the machine is touched until the package has been fully validated.
-#  1. Finds <USB>/TwinCAT_Update/manifest.txt on the mounted (or auto-mounted) drives.
+#  1. Finds <USB>/TwinCAT_Update/TwinCAT_Update.tar.gz and extracts it to <LOCAL_BACKUP_ROOT>/Staging.
 #  2. Checks the TwinCAT XAR and TF2000 HMI Server versions recorded in the package
 #     (versions.txt) exactly match this machine, and verifies every file in the
 #     package against its SHA-256 hash.
@@ -23,7 +23,7 @@
 #  the log is written to the USB stick (TwinCAT_Update/Logs).
 #
 #  Options:
-#    --package-path <dir>      Full path of the package folder. Default: search the USB drives.
+#    --package-path <path>     The package .tar.gz, or the folder holding it. Default: search the USB drives.
 #    --config <file>           Use a different config file instead of Config.sh.
 #    --no-reboot               Do not reboot; restart the HMI Server and put TwinCAT back
 #                              into Run mode instead.
@@ -54,7 +54,10 @@ while (( $# )); do
     shift
 done
 
-# Sets PKG to the single package folder found on the USB drives.
+# True if the folder holds a package: <name>.tar.gz, or (older, uncompressed format) manifest.txt.
+is_package_folder() { [[ -f $1/$PACKAGE_FOLDER_NAME.tar.gz || -f $1/manifest.txt ]]; }
+
+# Sets USB_DIR to the single package folder found on the USB drives.
 find_update_package() {
     mount_usb_drives
     local roots=() r p found=()
@@ -63,21 +66,21 @@ find_update_package() {
     roots+=(/media/* /media/*/* /run/media/*/* /mnt /mnt/*)
     for r in "${roots[@]}"; do
         p="$r/$PACKAGE_FOLDER_NAME"
-        [[ -f $p/manifest.txt ]] || continue
+        is_package_folder "$p" || continue
         p=$(readlink -f -- "$p")
         [[ -n ${seen[$p]} ]] && continue
         seen[$p]=1
         found+=("$p")
     done
     if (( ${#found[@]} == 0 )); then
-        log_error "No update package found (looked for <USB>/$PACKAGE_FOLDER_NAME/manifest.txt on the USB drives, /media, /run/media and /mnt)."
+        log_error "No update package found (looked for <USB>/$PACKAGE_FOLDER_NAME/$PACKAGE_FOLDER_NAME.tar.gz on the USB drives, /media, /run/media and /mnt)."
         return 1
     fi
     if (( ${#found[@]} > 1 )); then
         log_error "Several update packages found: $(join_array ', ' found). Remove all but one, or pass --package-path."
         return 1
     fi
-    PKG=${found[0]}
+    USB_DIR=${found[0]}
 }
 
 write_status() {   # status detail
@@ -172,7 +175,10 @@ MACHINE_TOUCHED=0    # 1 once the target folders may have been modified
 STOPPED=0            # 1 once TwinCAT/HMI were stopped
 CONFIG_LOADED=0
 RESTART_SERVICES=()
-PKG=''
+PKG=''          # uncompressed package (manifest.txt, Boot, HMI) that is verified and installed
+PKG_SOURCE=''   # the archive (or old-format folder) the update comes from
+USB_DIR=''      # package folder on the stick (logs are copied back there)
+STAGING_DIR=''
 
 fail() {
     (( $# )) && log_error "$*"
@@ -192,7 +198,8 @@ finish() {
         *) STATUS_TEXT="EXIT $EXIT_CODE" ;;
     esac
     if (( CONFIG_LOADED )); then
-        write_status "$STATUS_TEXT" "Package: $PKG"
+        write_status "$STATUS_TEXT" "Package: $PKG_SOURCE"
+        [[ -n $STAGING_DIR ]] && rm -rf -- "$STAGING_DIR"
         local reboot=0
         if (( STOPPED )); then
             if (( EXIT_CODE == 3 )); then
@@ -207,9 +214,9 @@ finish() {
         log "Result: $STATUS_TEXT (exit code $EXIT_CODE)"
 
         # Copy the log onto the USB stick so the result can be checked on the bench.
-        if [[ -n $PKG && -n $LOG_FILE && -d $PKG ]]; then
-            usb_log="$PKG/Logs/$(uname -n)_${STAMP}_${STATUS_TEXT//+([^A-Za-z])/_}.log"
-            { mkdir -p -- "$PKG/Logs" && cp -f -- "$LOG_FILE" "$usb_log"; } 2>/dev/null ||
+        if [[ -n $USB_DIR && -n $LOG_FILE && -d $USB_DIR ]]; then
+            usb_log="$USB_DIR/Logs/$(uname -n)_${STAMP}_${STATUS_TEXT//+([^A-Za-z])/_}.log"
+            { mkdir -p -- "$USB_DIR/Logs" && cp -f -- "$LOG_FILE" "$usb_log" && sync; } 2>/dev/null ||
                 log_warn "Could not copy log to USB: $usb_log"
         fi
         unmount_usb_drives
@@ -241,9 +248,33 @@ write_status RUNNING 'Update in progress'
 # =========================================================================
 #  PHASE 1 - validate. Nothing on the machine is changed in this phase.
 # =========================================================================
-if [[ -n $PACKAGE_PATH ]]; then PKG=$(readlink -f -- "$PACKAGE_PATH"); else find_update_package || fail; fi
+if [[ -n $PACKAGE_PATH && -f $PACKAGE_PATH ]]; then
+    PKG_SOURCE=$(readlink -f -- "$PACKAGE_PATH")
+    USB_DIR=$(dirname -- "$PKG_SOURCE")
+else
+    if [[ -n $PACKAGE_PATH ]]; then USB_DIR=$(readlink -f -- "$PACKAGE_PATH"); else find_update_package || fail; fi
+    PKG_SOURCE="$USB_DIR/$PACKAGE_FOLDER_NAME.tar.gz"
+    [[ -f $PKG_SOURCE ]] || PKG_SOURCE=$USB_DIR   # older, uncompressed package
+fi
+log "Package: $PKG_SOURCE"
+
+if [[ -f $PKG_SOURCE ]]; then
+    STAGING_DIR="$LOCAL_BACKUP_ROOT/Staging"
+    rm -rf -- "$STAGING_DIR" || fail "Could not clear '$STAGING_DIR'."
+    unpacked=$(archive_content_size "$PKG_SOURCE")
+    (( ${unpacked:-0} > 0 )) || fail "Could not read the package archive '$PKG_SOURCE' (damaged?)."
+    free=$(free_bytes "$LOCAL_BACKUP_ROOT")
+    (( ${free:-0} >= unpacked * 11 / 10 + 50 * 1048576 )) ||
+        fail "Not enough free space to extract the package ($(format_mb "$unpacked") MB needed in $LOCAL_BACKUP_ROOT)."
+    log_step "Extracting package to $STAGING_DIR"
+    extract_archive "$PKG_SOURCE" "$STAGING_DIR" || fail
+    PKG=$STAGING_DIR
+else
+    log_warn 'Package is an uncompressed folder (older format) - using it directly.'
+    PKG=$PKG_SOURCE
+fi
+
 read_manifest "$PKG" || fail
-log "Package: $PKG"
 log "  created ${MANIFEST[CreatedLocal]} on ${MANIFEST[ComputerName]}, TwinCAT ${MANIFEST[TwinCATVersion]}"
 [[ ${MANIFEST[Purpose]} == UpdatePackage ]] || fail "'$PKG' is not an update package (purpose: ${MANIFEST[Purpose]})."
 

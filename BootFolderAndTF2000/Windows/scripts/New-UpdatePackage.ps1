@@ -4,11 +4,11 @@
 
 .DESCRIPTION
     1. Switches TwinCAT to Config mode via ADS and stops the TwinCAT HMI Server service.
-    2. Copies the Boot folder and HMI Server folder into <USB>\TwinCAT_Update.partial,
+    2. Copies the Boot folder and HMI Server folder into a local build folder (%TEMP%),
        hashes every file (SHA-256) and writes manifest.json.
-    3. Renames the folder to <USB>\TwinCAT_Update (the previous package is kept as
-       TwinCAT_Update_previous).
-    4. Restarts the HMI Server and puts TwinCAT back into Run mode if it was running.
+    3. Restarts the HMI Server and puts TwinCAT back into Run mode if it was running.
+    4. Zips the build folder to <USB>\TwinCAT_Update\TwinCAT_Update.zip (written as .partial
+       first; the previous package is kept as TwinCAT_Update_previous.zip).
 
 .PARAMETER Destination
     Drive or folder in which to create the package folder (e.g. E:\).
@@ -47,30 +47,66 @@ function Resolve-PackageDestination {
     throw "Several removable drives found ($(($removable | ForEach-Object { $_.Name }) -join ', ')). Pass -Destination to choose one."
 }
 
+# Restarts what was stopped. Does its work once: right after the copy, or in finally on failure.
+function Restore-BenchState {
+    if ($LeaveStopped) {
+        if ($script:adsUsed) { Write-Log -Level WARN '-LeaveStopped given: TwinCAT left in Config mode, HMI Server left stopped.' }
+        $script:adsUsed = $false
+        return
+    }
+    foreach ($svc in $script:servicesToStart) { [void](Start-ServiceSafe -Name $svc -TimeoutSec $S.ServiceStopTimeoutSec) }
+    $script:servicesToStart = @()
+    if ($script:tcWasRunning) {
+        $script:tcWasRunning = $false
+        try { Set-TwinCATMode -Mode Run -TimeoutSec $S.AdsStateTimeoutSec }
+        catch { Write-Log -Level WARN "Could not return TwinCAT to Run mode: $($_.Exception.Message)"; $script:restoreFailed = $true }
+    }
+}
+
 $exitCode = 1
 $tcWasRunning = $false
 $servicesToStart = @()
 $adsUsed = $false
+$restoreFailed = $false
+$buildDir = $null
 
 try {
     Assert-Prerequisites
     $config = Import-UpdateConfig -Path $ConfigPath
     $S = $config.Settings
 
+    Initialize-Zip
     $destRoot = Resolve-PackageDestination $Destination
-    $pkgFinal = Join-Path $destRoot $S.PackageFolderName
-    $pkgTemp = "$pkgFinal.partial"
-    $pkgPrev = "$($pkgFinal)_previous"
+    $pkgDir = Join-Path $destRoot $S.PackageFolderName
+    $zipFinal = Join-Path $pkgDir "$($S.PackageFolderName).zip"
+    $zipTemp = "$zipFinal.partial"
+    $zipPrev = Join-Path $pkgDir "$($S.PackageFolderName)_previous.zip"
+    $logFinal = Join-Path $pkgDir 'create.log'
+    $logTemp = Join-Path $pkgDir 'create.partial.log'
 
-    if (Test-Path -LiteralPath $pkgTemp) { Remove-Item -LiteralPath $pkgTemp -Recurse -Force }
-    New-Item -ItemType Directory -Path $pkgTemp -Force | Out-Null
-    Start-Log (Join-Path $pkgTemp 'create.log')
+    # An unzipped package from an older version of this tool: keep it as <folder>_previous.
+    $oldStyle = $false
+    if (Test-Path -LiteralPath (Join-Path $pkgDir 'manifest.json') -PathType Leaf) {
+        $oldStyle = $true
+        $pkgPrev = "$($pkgDir)_previous"
+        if (Test-Path -LiteralPath $pkgPrev) { Remove-Item -LiteralPath $pkgPrev -Recurse -Force }
+        Rename-Item -LiteralPath $pkgDir -NewName (Split-Path -Leaf $pkgPrev)
+    }
+    New-Item -ItemType Directory -Path $pkgDir -Force | Out-Null
+    if (Test-Path -LiteralPath $logTemp) { Remove-Item -LiteralPath $logTemp -Force }
+    Start-Log $logTemp
 
     Write-Log -Level STEP '=== Create TwinCAT update package (bench) ==='
     Write-Log "Running as $([Security.Principal.WindowsIdentity]::GetCurrent().Name) on $env:COMPUTERNAME"
+    if ($oldStyle) { Write-Log "Unzipped package from an older version moved to $pkgPrev" }
     $tc = Get-TwinCATInfo
     Write-Log "TwinCAT version: $($tc.Version)   AMS Net ID: $($tc.AmsNetId)"
-    Write-Log "Package folder:  $pkgFinal"
+    Write-Log "Package file:    $zipFinal"
+
+    $buildDir = Join-Path ([IO.Path]::GetTempPath()) "$($S.PackageFolderName)_build"
+    if (Test-Path -LiteralPath $buildDir) { Remove-Item -LiteralPath $buildDir -Recurse -Force }
+    New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
+    Write-Log "Build folder:    $buildDir"
 
     # --- Record installed versions (checked by Apply-Update on the machine) -------
     $versions = Get-InstalledVersions -HmiServiceName $S.HmiServiceName
@@ -78,7 +114,7 @@ try {
         if (-not $versions[$k]) { throw "Could not read the installed $k version on this bench system." }
         Write-Log "Version $($k.PadRight(18)) $($versions[$k])"
     }
-    Write-VersionFile -Path (Join-Path $pkgTemp 'versions.json') -Versions $versions
+    Write-VersionFile -Path (Join-Path $buildDir 'versions.json') -Versions $versions
 
     # --- Resolve source folders -------------------------------------------------
     $entries = foreach ($item in $config.Items) {
@@ -104,9 +140,12 @@ try {
     foreach ($e in $entries) {
         foreach ($f in Get-FolderInventory -Root $e.SourcePath -ExcludeFiles $e.ExcludeFiles -ExcludeDirs $e.ExcludeDirs -NoHash) { $needed += $f.Size }
     }
-    $free = (New-Object IO.DriveInfo ([IO.Path]::GetPathRoot($pkgTemp))).AvailableFreeSpace
-    Write-Log ("Package size: {0:N1} MB, free on destination: {1:N1} MB" -f ($needed / 1MB), ($free / 1MB))
+    # The zip is never much bigger than the files, so the same margin covers both drives.
+    $free = (New-Object IO.DriveInfo ([IO.Path]::GetPathRoot($zipTemp))).AvailableFreeSpace
+    $freeBuild = (New-Object IO.DriveInfo ([IO.Path]::GetPathRoot($buildDir))).AvailableFreeSpace
+    Write-Log ("Package size: {0:N1} MB, free on destination: {1:N1} MB, free for build folder: {2:N1} MB" -f ($needed / 1MB), ($free / 1MB), ($freeBuild / 1MB))
     if ($free -lt ($needed * 1.1 + 10MB)) { throw 'Not enough free space on the destination drive.' }
+    if ($freeBuild -lt ($needed * 1.1 + 10MB)) { throw "Not enough free space for the build folder $buildDir." }
 
     # --- Stop TwinCAT runtime + HMI Server ---------------------------------------
     if ($NoStop) {
@@ -119,16 +158,23 @@ try {
     }
 
     # --- Copy + hash ------------------------------------------------------------
-    $manifest = New-FolderSnapshot -Entries $entries -Destination $pkgTemp -Purpose 'UpdatePackage'
+    $manifest = New-FolderSnapshot -Entries $entries -Destination $buildDir -Purpose 'UpdatePackage'
+    Restore-BenchState   # copy done: TwinCAT and the HMI Server can run again while zipping
+
+    # --- Zip onto the stick -------------------------------------------------------
+    Write-Log -Level STEP "Zipping package to $zipTemp"
+    Compress-Folder -Folder $buildDir -ZipPath $zipTemp
 
     # --- Publish: .partial -> final (keep one previous package) -------------------
-    if (Test-Path -LiteralPath $pkgFinal) {
-        if (Test-Path -LiteralPath $pkgPrev) { Remove-Item -LiteralPath $pkgPrev -Recurse -Force }
-        Rename-Item -LiteralPath $pkgFinal -NewName (Split-Path -Leaf $pkgPrev)
-        Write-Log "Previous package kept as $pkgPrev"
+    if (Test-Path -LiteralPath $zipFinal) {
+        if (Test-Path -LiteralPath $zipPrev) { Remove-Item -LiteralPath $zipPrev -Force }
+        Rename-Item -LiteralPath $zipFinal -NewName (Split-Path -Leaf $zipPrev)
+        Write-Log "Previous package kept as $zipPrev"
     }
-    Rename-Item -LiteralPath $pkgTemp -NewName (Split-Path -Leaf $pkgFinal)
-    $script:LogFile = Join-Path $pkgFinal 'create.log'
+    Rename-Item -LiteralPath $zipTemp -NewName (Split-Path -Leaf $zipFinal)
+    if (Test-Path -LiteralPath $logFinal) { Move-Item -LiteralPath $logFinal -Destination (Join-Path $pkgDir 'create_previous.log') -Force }
+    Move-Item -LiteralPath $logTemp -Destination $logFinal -Force
+    $script:LogFile = $logFinal
 
     foreach ($i in $manifest.Items) { Write-Log -Level OK ("  {0,-6} {1,6} files  {2,10:N1} MB" -f $i.Name, $i.FileCount, ($i.TotalBytes / 1MB)) }
     Write-Log -Level OK "Package created: $pkgFinal"
@@ -137,18 +183,12 @@ try {
 catch {
     Write-Log -Level ERROR $_.Exception.Message
     Write-Log -Level ERROR ($_.ScriptStackTrace -replace '\r?\n', ' <- ')
-    Write-Log -Level ERROR 'Package NOT created. Any incomplete copy is left as *.partial and will never be used.'
+    Write-Log -Level ERROR 'Package NOT created. Any incomplete zip is left as *.partial and will never be used.'
 }
 finally {
-    if (-not $LeaveStopped) {
-        foreach ($svc in $servicesToStart) { [void](Start-ServiceSafe -Name $svc -TimeoutSec $S.ServiceStopTimeoutSec) }
-        if ($tcWasRunning) {
-            try { Set-TwinCATMode -Mode Run -TimeoutSec $S.AdsStateTimeoutSec }
-            catch { Write-Log -Level WARN "Could not return TwinCAT to Run mode: $($_.Exception.Message)"; $exitCode = 1 }
-        }
-    } elseif ($adsUsed) {
-        Write-Log -Level WARN '-LeaveStopped given: TwinCAT left in Config mode, HMI Server left stopped.'
-    }
+    if ($S) { Restore-BenchState }
+    if ($restoreFailed) { $exitCode = 1 }
+    if ($buildDir -and (Test-Path -LiteralPath $buildDir)) { Remove-Item -LiteralPath $buildDir -Recurse -Force -ErrorAction SilentlyContinue }
     Close-Ads
 }
 exit $exitCode

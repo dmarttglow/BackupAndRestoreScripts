@@ -5,7 +5,8 @@
 
 .DESCRIPTION
     Nothing on the machine is touched until the package has been fully validated.
-    1. Finds <drive>:\TwinCAT_Update\manifest.json on the attached drives.
+    1. Finds <drive>:\TwinCAT_Update\TwinCAT_Update.zip on the attached drives and unzips
+       it to <LocalBackupRoot>\Staging (deleted again at the end).
     2. Checks the TwinCAT XAR and TF2000 HMI Server versions recorded in the package
        (versions.json) exactly match this machine, and verifies every file in the
        package against its SHA-256 hash.
@@ -23,7 +24,9 @@
     log is written to the USB stick (TwinCAT_Update\Logs).
 
 .PARAMETER PackagePath
-    Full path of the package folder. Default: search all drives for \TwinCAT_Update.
+    Full path of the package zip, or of the folder that contains it.
+    Default: search all drives for \TwinCAT_Update\TwinCAT_Update.zip.
+    An unzipped package folder from an older version of this tool also works.
 
 .PARAMETER NoReboot
     Do not reboot; restart the HMI Server and put TwinCAT back into Run mode instead.
@@ -44,14 +47,21 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'Common.ps1')
 if (-not $ConfigPath) { $ConfigPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'Config.ps1' }
 
+# True if Folder holds a package: <FolderName>.zip, or (older, unzipped format) manifest.json.
+function Test-PackageFolder {
+    param([string]$Folder, [string]$FolderName)
+    (Test-Path -LiteralPath (Join-Path $Folder "$FolderName.zip") -PathType Leaf) -or
+        (Test-Path -LiteralPath (Join-Path $Folder 'manifest.json') -PathType Leaf)
+}
+
 function Find-UpdatePackage {
     param([string]$FolderName)
     $found = @(foreach ($d in [IO.DriveInfo]::GetDrives()) {
         if (-not $d.IsReady -or $d.DriveType -notin 'Removable', 'Fixed') { continue }
         $p = Join-Path $d.RootDirectory.FullName $FolderName
-        if (Test-Path -LiteralPath (Join-Path $p 'manifest.json') -PathType Leaf) { $p }
+        if (Test-PackageFolder $p $FolderName) { $p }
     })
-    if ($found.Count -eq 0) { throw "No update package found (looked for <drive>:\$FolderName\manifest.json on all drives)." }
+    if ($found.Count -eq 0) { throw "No update package found (looked for <drive>:\$FolderName\$FolderName.zip on all drives)." }
     if ($found.Count -gt 1) { throw "Several update packages found: $($found -join ', '). Remove all but one, or pass -PackagePath." }
     $found[0]
 }
@@ -85,6 +95,10 @@ $servicesToStart = @()
 $mutex = $null
 $S = $null
 $pkg = $null
+$pkgSource = $null
+$usbDir = $null
+$stagingDir = $null
+$errorText = ''
 
 try {
     # --- Single instance (double button press, etc.) ----------------------------
@@ -100,15 +114,49 @@ try {
     Write-Log -Level STEP '=== Apply TwinCAT update package ==='
     Write-Log "Running as $([Security.Principal.WindowsIdentity]::GetCurrent().Name) on $env:COMPUTERNAME"
     Write-Status $S.LocalBackupRoot 'RUNNING' 'Update in progress'
+    # Read by the optional status screen (UpdateScreen\). The update does not depend on it.
+    Start-ProgressFile -Path (Join-Path $S.LocalBackupRoot 'update_progress.json') -RunId $stamp
+    Set-ProgressStep check 'Looking for the update package' 0 3
 
     # =========================================================================
     #  PHASE 1 - validate. Nothing on the machine is changed in this phase.
     # =========================================================================
-    $pkg = if ($PackagePath) { Get-NormalizedPath $PackagePath } else { Find-UpdatePackage $S.PackageFolderName }
+    # $usbDir: package folder on the stick (logs are copied back there).
+    # $pkgSource: the zip (or old-format folder) the update comes from.
+    # $pkg: unzipped package (manifest.json, Boot, HMI) that is verified and installed.
+    $zipName = "$($S.PackageFolderName).zip"
+    if ($PackagePath -and (Test-Path -LiteralPath $PackagePath -PathType Leaf)) {
+        $pkgSource = Get-NormalizedPath $PackagePath
+        $usbDir = Split-Path -Parent $pkgSource
+    } else {
+        $usbDir = if ($PackagePath) { Get-NormalizedPath $PackagePath } else { Find-UpdatePackage $S.PackageFolderName }
+        $pkgSource = Join-Path $usbDir $zipName
+        if (-not (Test-Path -LiteralPath $pkgSource -PathType Leaf)) { $pkgSource = $usbDir }   # older, unzipped package
+    }
+    Write-Log "Package: $pkgSource"
+
+    if (Test-Path -LiteralPath $pkgSource -PathType Leaf) {
+        $stagingDir = Join-Path $S.LocalBackupRoot 'Staging'
+        if (Test-Path -LiteralPath $stagingDir) { Remove-Item -LiteralPath $stagingDir -Recurse -Force }
+        $unzipBytes = Get-ZipContentSize $pkgSource
+        $stagingFree = (New-Object IO.DriveInfo ([IO.Path]::GetPathRoot((Get-NormalizedPath $S.LocalBackupRoot)))).AvailableFreeSpace
+        if ($stagingFree -lt ($unzipBytes * 1.1 + 50MB)) {
+            throw ("Not enough free space to unzip the package ({0:N1} MB needed in {1})." -f ($unzipBytes / 1MB), $S.LocalBackupRoot)
+        }
+        Set-ProgressStep unpack 'Unpacking the update package' 3 20
+        Write-Log -Level STEP "Unzipping package to $stagingDir"
+        Expand-ZipFile -ZipPath $pkgSource -Destination $stagingDir
+        $pkg = $stagingDir
+    } else {
+        Write-Log -Level WARN 'Package is an unzipped folder (older format) - using it directly.'
+        $pkg = $pkgSource
+    }
+
     $manifest = Read-Manifest $pkg
-    Write-Log "Package: $pkg"
     Write-Log "  created $($manifest.CreatedLocal) on $($manifest.ComputerName), TwinCAT $($manifest.TwinCATVersion)"
     if ($manifest.Purpose -ne 'UpdatePackage') { throw "'$pkg' is not an update package (purpose: $($manifest.Purpose))." }
+
+    Set-ProgressStep check 'Checking versions and package contents' 20 22
 
     # Versions must match exactly: XAR and TF2000 on this machine vs. the bench that built the package.
     $pkgVersions = Read-VersionFile (Join-Path $pkg 'versions.json')
@@ -146,6 +194,7 @@ try {
         if (-not ($plan | Where-Object { $_.Name -eq $ci.Name })) { throw "Package does not contain required item '$($ci.Name)'." }
     }
 
+    Set-ProgressStep verify 'Verifying the update package' 22 35
     Write-Log -Level STEP 'Verifying package integrity (SHA-256)...'
     foreach ($p in $plan) {
         $problems = @(Compare-FolderToManifest -Root (Join-Path $pkg $p.Name) -ManifestItem $p.Manifest -Activity "Checking package [$($p.Name)]")
@@ -169,10 +218,12 @@ try {
     #  PHASE 2 - stop, back up, replace, verify
     # =========================================================================
     $stopped = $true
+    Set-ProgressStep stop 'Stopping TwinCAT and the HMI Server' 35 40
     Set-TwinCATMode -Mode Config -TimeoutSec $S.AdsStateTimeoutSec
     $servicesToStart = @(Stop-ServiceWithTimeout -Name $S.HmiServiceName -TimeoutSec $S.ServiceStopTimeoutSec)
 
     $backupDir = Join-Path $S.LocalBackupRoot "${stamp}_before_update"
+    Set-ProgressStep backup 'Backing up the current version' 40 60
     Write-Log -Level STEP "Backing up current version to $backupDir"
     $backupEntries = foreach ($p in $plan) {
         [pscustomobject]@{ Name = $p.Name; Description = $p.Description; SourcePath = $p.Target; ExcludeFiles = @(); ExcludeDirs = @() }
@@ -181,12 +232,14 @@ try {
     Write-VersionFile -Path (Join-Path $backupDir 'versions.json') -Versions $localVersions
 
     try {
+        Set-ProgressStep install 'Installing the new version' 60 75
         foreach ($p in $plan) {
             Write-Log -Level STEP "[$($p.Name)] replacing $($p.Target)"
             $machineTouched = $true
             Invoke-Robocopy -Source (Join-Path $pkg $p.Name) -Destination $p.Target -Mirror -Label "Installing [$($p.Name)]" `
                 -ExcludeFiles $p.ExcludeFiles -ExcludeDirs $p.ExcludeDirs -LogPath (Join-Path $backupDir 'apply-robocopy.log')
         }
+        Set-ProgressStep verifyinstall 'Verifying the installed files' 75 97
         Write-Log -Level STEP 'Verifying installed files (SHA-256)...'
         foreach ($p in $plan) {
             $problems = @(Compare-FolderToManifest -Root $p.Target -ManifestItem $p.Manifest -Activity "Verifying installed [$($p.Name)]")
@@ -199,6 +252,7 @@ try {
     }
     catch {
         Write-Log -Level ERROR "Update failed: $($_.Exception.Message)"
+        Set-ProgressStep rollback 'Update failed - restoring the previous version' 60 97
         Write-Log -Level STEP "ROLLING BACK from $backupDir"
         $rollbackOk = $true
         foreach ($bi in $backupManifest.Items) {
@@ -228,6 +282,7 @@ try {
 catch {
     if ($exitCode -eq 0) { $exitCode = 1 }
     if ($exitCode -eq 1 -and $machineTouched) { $exitCode = 3 }   # failed while copying, outside the rollback block
+    $errorText = $_.Exception.Message
     Write-Log -Level ERROR $_.Exception.Message
     if ($_.ScriptStackTrace) { Write-Log -Level ERROR ($_.ScriptStackTrace -replace '\r?\n', ' <- ') }
 }
@@ -237,22 +292,29 @@ finally {
         3 { 'FAILED - ROLLBACK FAILED, manual repair needed' } default { "EXIT $exitCode" }
     }
     if ($S) {
-        Write-Status $S.LocalBackupRoot $statusText "Package: $pkg"
+        Write-Status $S.LocalBackupRoot $statusText "Package: $pkgSource"
+
+        if ($stagingDir -and (Test-Path -LiteralPath $stagingDir)) {
+            Remove-Item -LiteralPath $stagingDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
 
         # Copy the log onto the USB stick so the result can be checked on the bench.
-        if ($pkg -and $script:LogFile -and (Test-Path -LiteralPath $pkg)) {
+        if ($usbDir -and $script:LogFile -and (Test-Path -LiteralPath $usbDir)) {
             try {
-                $usbLogs = Join-Path $pkg 'Logs'
+                $usbLogs = Join-Path $usbDir 'Logs'
                 New-Item -ItemType Directory -Path $usbLogs -Force | Out-Null
                 Copy-Item -LiteralPath $script:LogFile -Destination (Join-Path $usbLogs "$($env:COMPUTERNAME)_$stamp`_$($statusText -replace '[^A-Za-z]+', '_').log") -Force
             } catch { Write-Log -Level WARN "Could not copy log to USB: $($_.Exception.Message)" }
         }
 
+        $progressState = switch ($exitCode) { 0 { 'Success' } 2 { 'RolledBack' } 3 { 'RollbackFailed' } default { 'Failed' } }
+        $rebooting = $stopped -and $exitCode -ne 3 -and $S.RebootAfterApply -and -not $NoReboot
         if ($stopped) {
             if ($exitCode -eq 3) {
                 Write-Log -Level ERROR 'Machine left stopped (Config mode) because the rollback failed. NOT rebooting.'
             } elseif ($S.RebootAfterApply -and -not $NoReboot) {
                 Write-Log -Level STEP "Rebooting in $($S.RebootDelaySeconds) s..."
+                Set-ProgressResult -State $progressState -ErrorText $errorText -RebootInSec $S.RebootDelaySeconds
                 & shutdown.exe /r /f /t $S.RebootDelaySeconds /d p:4:1 /c "TwinCAT update: $statusText"
                 for ($s = [int]$S.RebootDelaySeconds; $s -gt 0; $s--) {
                     Write-ProgressLine -Force "$statusText - controller restarts in $s s  (cancel: shutdown /a)"
@@ -260,11 +322,13 @@ finally {
                 }
                 Clear-ProgressLine
             } else {
+                Set-ProgressStep restart 'Starting TwinCAT and the HMI Server' 97 99
                 foreach ($svc in $servicesToStart) { [void](Start-ServiceSafe -Name $svc -TimeoutSec $S.ServiceStopTimeoutSec) }
                 try { Set-TwinCATMode -Mode Run -TimeoutSec $S.AdsStateTimeoutSec }
                 catch { Write-Log -Level ERROR "Could not switch TwinCAT to Run mode: $($_.Exception.Message)" }
             }
         }
+        if (-not $rebooting) { Set-ProgressResult -State $progressState -ErrorText $errorText }
         Write-Log "Result: $statusText (exit code $exitCode)"
     }
     Close-Ads

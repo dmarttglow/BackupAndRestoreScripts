@@ -96,7 +96,7 @@ assert_prerequisites() {
         log_error 'This script must run as root (sudo, or as root when started from the PLC).'; return 1
     fi
     local c missing=()
-    for c in rsync sha256sum find sort awk df flock lsblk mount umount systemctl timeout; do
+    for c in rsync sha256sum find sort awk df flock lsblk mount umount systemctl timeout tar gzip; do
         command -v "$c" >/dev/null 2>&1 || missing+=("$c")
     done
     if (( ${#missing[@]} )); then
@@ -384,6 +384,47 @@ _manifest_list() { local -n _ml=$2; local v; for v in "${_ml[@]}"; do body+="$1=
 
 # Reads <Folder>/manifest.txt into MANIFEST (key -> value) and MANIFEST_ITEMS.
 # Repeated keys (ExcludeFile / ExcludeDir) are joined with newlines.
+# -----------------------------------------------------------------------------
+#  Archive (the package travels on the USB stick as a single .tar.gz file)
+# -----------------------------------------------------------------------------
+
+# Runs a command in the background while showing a progress line.
+_run_with_progress() {   # label command...
+    local label=$1 t0=$SECONDS pid code
+    shift
+    "$@" &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        progress_line "$label ...  $(format_elapsed $(( SECONDS - t0 ))) elapsed"
+        sleep 0.25
+    done
+    wait "$pid"; code=$?
+    clear_progress
+    return $code
+}
+
+# Packs everything under folder into archive (overwritten).
+compress_folder() {   # folder archive
+    local t0=$SECONDS
+    rm -f -- "$2"
+    _run_with_progress 'Compressing' tar -czf "$2" --numeric-owner --owner=0 --group=0 -C "$1" . 2>>"${LOG_FILE:-/dev/null}" ||
+        { log_error "tar failed creating '$2'."; return 1; }
+    log "Compressed in $(format_elapsed $(( SECONDS - t0 ))): $(format_mb "$(du -sb -- "$1" | cut -f1)") MB -> $(format_mb "$(stat -c %s -- "$2")") MB"
+}
+
+# Prints the total uncompressed size of the files in an archive.
+archive_content_size() { tar -tvzf "$1" 2>/dev/null | awk '{ s += $3 } END { printf "%.0f\n", s }'; }
+
+# Extracts archive into destination (created; must not exist yet). GNU tar
+# refuses member names with '..' or a leading '/'.
+extract_archive() {   # archive destination
+    local t0=$SECONDS
+    mkdir -p -- "$2" || { log_error "Could not create '$2'."; return 1; }
+    _run_with_progress 'Extracting' tar -xzf "$1" -C "$2" --no-same-owner --no-same-permissions 2>>"${LOG_FILE:-/dev/null}" ||
+        { log_error "tar failed extracting '$1' (archive damaged?)."; return 1; }
+    log "Extracted in $(format_elapsed $(( SECONDS - t0 )))"
+}
+
 read_manifest() {
     local file="$1/manifest.txt" line k v
     [[ -f $file ]] || { log_error "No manifest.txt in '$1' (incomplete or not a package)."; return 1; }

@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<!-- saved from url=(0014)about:internet -->
+<html>
+<head>
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta charset="utf-8">
+<title>System update</title>
+<!--
+  Status screen shown on the machine IPC while Apply-Update runs.
+  Rendered by Show-UpdateScreen.ps1 in a WPF WebBrowser control (Internet
+  Explorer 11 engine), so keep the CSS/JS IE11-compatible: no CSS variables,
+  no grid, no arrow functions / let / const / template strings.
+  Show-UpdateScreen.ps1 calls updateStatus(json) about twice a second.
+  The Close button navigates to http://updatescreen.close/, which the host
+  intercepts to close the window.
+-->
+<style>
+html, body { margin: 0; height: 100%; overflow: hidden; }
+body {
+    background: #10151c; color: #e8ecf1;
+    font-family: "Segoe UI", Arial, sans-serif;
+    cursor: default; -ms-user-select: none; user-select: none;
+}
+.topline { position: absolute; top: 0; left: 0; right: 0; height: 10px; background: #f0a020; }
+.wrap {
+    position: absolute; top: 50%; left: 50%; width: 960px; max-width: 92%;
+    -ms-transform: translate(-50%, -50%); transform: translate(-50%, -50%);
+}
+.head { overflow: hidden; margin-bottom: 36px; }
+.icon { float: left; width: 120px; height: 120px; margin-right: 36px; }
+.icon svg { width: 120px; height: 120px; display: none; }
+#icoRunning { -ms-animation: spin 1.4s linear infinite; animation: spin 1.4s linear infinite; }
+@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+.titles { overflow: hidden; padding-top: 6px; }
+h1 { font-size: 52px; font-weight: 600; margin: 0 0 10px 0; line-height: 1.1; }
+.sub { font-size: 26px; color: #b8c2cf; margin: 0; line-height: 1.35; }
+
+.warn {
+    border: 3px solid #f0a020; background: #2a2210; color: #ffd27a;
+    font-size: 30px; font-weight: 600; padding: 18px 26px; margin-bottom: 36px;
+}
+.warn small { display: block; font-size: 20px; font-weight: 400; color: #e6c98a; margin-top: 4px; }
+
+.bar { height: 34px; background: #222b36; border-radius: 17px; overflow: hidden; }
+.fill {
+    height: 100%; width: 0; background-color: #f0a020; border-radius: 17px;
+    background-image: linear-gradient(45deg, rgba(255,255,255,.18) 25%, transparent 25%, transparent 50%,
+                                      rgba(255,255,255,.18) 50%, rgba(255,255,255,.18) 75%, transparent 75%, transparent);
+    background-size: 48px 48px;
+    -ms-transition: width .6s ease; transition: width .6s ease;
+    -ms-animation: stripes 1.2s linear infinite; animation: stripes 1.2s linear infinite;
+}
+@keyframes stripes { from { background-position: 48px 0; } to { background-position: 0 0; } }
+.barinfo { overflow: hidden; margin-top: 14px; font-size: 26px; }
+.barinfo .pct { float: right; font-weight: 600; }
+.barinfo .step { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.detail {
+    margin-top: 6px; font-size: 17px; color: #7f8b99; font-family: Consolas, monospace;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; height: 24px;
+}
+
+.steps { margin: 38px 0 0 0; padding: 0; list-style: none; overflow: hidden; }
+.steps li {
+    float: left; width: 12.5%; text-align: center; font-size: 16px; color: #5d6875;
+    position: relative; padding-top: 30px;
+}
+.steps li:before {
+    content: ""; position: absolute; top: 4px; left: 50%; margin-left: -9px;
+    width: 14px; height: 14px; border-radius: 50%; border: 2px solid #3a4553; background: #10151c;
+}
+.steps li.done { color: #9fb0c2; }
+.steps li.done:before { background: #3fae5a; border-color: #3fae5a; }
+.steps li.active { color: #ffd27a; font-weight: 600; }
+.steps li.active:before { background: #f0a020; border-color: #f0a020; }
+.steps li.bad { color: #ff8a80; font-weight: 600; }
+.steps li.bad:before { background: #e04848; border-color: #e04848; }
+
+.error {
+    display: none; margin-top: 28px; font-size: 19px; color: #ffb3ad;
+    font-family: Consolas, monospace; background: #2a1517; padding: 14px 18px; word-wrap: break-word;
+}
+.foot { position: absolute; left: 40px; right: 40px; bottom: 28px; font-size: 17px; color: #5d6875; }
+.foot .right { float: right; }
+.stale { color: #ffb347; }
+
+.closebtn {
+    display: none; margin-top: 34px; padding: 16px 44px; font-size: 24px; font-weight: 600;
+    background: #2f3a47; color: #e8ecf1; text-decoration: none; border-radius: 6px;
+}
+.closebtn:hover { background: #3c4a5a; }
+.autoclose { display: none; margin-left: 20px; font-size: 18px; color: #7f8b99; }
+
+/* Final states */
+body.st-success .topline, body.st-success .fill { background-color: #3fae5a; }
+body.st-warning .topline, body.st-warning .fill { background-color: #f0a020; }
+body.st-error .topline, body.st-error .fill { background-color: #e04848; }
+body.st-success .fill, body.st-warning .fill, body.st-error .fill { -ms-animation: none; animation: none; background-image: none; }
+body.st-error .warn { border-color: #e04848; background: #2a1517; color: #ffb3ad; }
+body.st-error .warn small { color: #e8a9a4; }
+</style>
+</head>
+<body class="st-running" oncontextmenu="return false" onselectstart="return false">
+<div class="topline"></div>
+<div class="wrap">
+    <div class="head">
+        <div class="icon">
+            <svg id="icoRunning" viewBox="0 0 120 120">
+                <circle cx="60" cy="60" r="52" fill="none" stroke="#2a3441" stroke-width="10"/>
+                <path d="M60 8 A52 52 0 0 1 112 60" fill="none" stroke="#f0a020" stroke-width="10" stroke-linecap="round"/>
+            </svg>
+            <svg id="icoSuccess" viewBox="0 0 120 120">
+                <circle cx="60" cy="60" r="56" fill="#3fae5a"/>
+                <path d="M34 62 L52 80 L88 42" fill="none" stroke="#fff" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            <svg id="icoWarning" viewBox="0 0 120 120">
+                <path d="M60 8 L114 108 L6 108 Z" fill="#f0a020" stroke="#f0a020" stroke-width="6" stroke-linejoin="round"/>
+                <rect x="54" y="40" width="12" height="38" rx="5" fill="#10151c"/>
+                <circle cx="60" cy="92" r="7" fill="#10151c"/>
+            </svg>
+            <svg id="icoError" viewBox="0 0 120 120">
+                <circle cx="60" cy="60" r="56" fill="#e04848"/>
+                <path d="M40 40 L80 80 M80 40 L40 80" stroke="#fff" stroke-width="11" stroke-linecap="round"/>
+            </svg>
+        </div>
+        <div class="titles">
+            <h1 id="title">Preparing system update</h1>
+            <p class="sub" id="sub">Please wait.</p>
+        </div>
+    </div>
+
+    <div class="warn" id="warn">
+        <span id="warnText">Do not switch off the power or remove the USB stick.</span>
+        <small id="warnSmall">The machine will restart by itself when the update is finished.</small>
+    </div>
+
+    <div class="bar"><div class="fill" id="fill"></div></div>
+    <div class="barinfo"><span class="pct" id="pct">0 %</span><div class="step" id="step">Starting...</div></div>
+    <div class="detail" id="detail"></div>
+
+    <ul class="steps" id="steps"></ul>
+
+    <div class="error" id="error"></div>
+    <a class="closebtn" id="closeBtn" href="http://updatescreen.close/">Close</a><span class="autoclose" id="autoclose"></span>
+</div>
+<div class="foot">
+    <span class="right" id="footRight"></span>
+    <span id="footLeft"></span>
+</div>
+
+<script>
+var STEPS = [
+    ['check', 'Check'], ['unpack', 'Unpack'], ['verify', 'Verify package'], ['stop', 'Stop TwinCAT'],
+    ['backup', 'Back up'], ['install', 'Install'], ['verifyinstall', 'Verify'], ['restart', 'Restart']
+];
+// Map step keys that are not in the list above onto a list position.
+var STEP_ALIAS = { rollback: 'install' };
+
+function el(id) { return document.getElementById(id); }
+function setText(id, t) { var e = el(id); t = (t === null || t === undefined) ? '' : String(t); if (e.innerText !== t) { e.innerText = t; } }
+function show(id, on) { el(id).style.display = on ? '' : 'none'; }
+function showAs(id, on, how) { el(id).style.display = on ? how : 'none'; }
+function fmtTime(sec) {
+    sec = Math.max(0, Math.floor(sec || 0));
+    var m = Math.floor(sec / 60), s = sec % 60;
+    return (m < 10 ? '0' : '') + m + ':' + (s < 10 ? '0' : '') + s;
+}
+function stepIndex(key) {
+    key = STEP_ALIAS[key] || key;
+    for (var i = 0; i < STEPS.length; i++) { if (STEPS[i][0] === key) { return i; } }
+    return -1;
+}
+
+(function buildSteps() {
+    var ul = el('steps'), html = '';
+    for (var i = 0; i < STEPS.length; i++) { html += '<li id="st' + i + '">' + STEPS[i][1] + '</li>'; }
+    ul.innerHTML = html;
+})();
+
+function renderSteps(s) {
+    var cur = stepIndex(s.StepKey), final = s.Phase === 'final', ok = s.State === 'Success';
+    for (var i = 0; i < STEPS.length; i++) {
+        var c = '';
+        if (final && ok) { c = 'done'; }
+        else if (i < cur) { c = 'done'; }
+        else if (i === cur) { c = (s.StepKey === 'rollback' || (final && !ok)) ? 'bad' : 'active'; }
+        el('st' + i).className = c;
+    }
+}
+
+function setIcon(name) {
+    var all = ['Running', 'Success', 'Warning', 'Error'];
+    for (var i = 0; i < all.length; i++) { el('ico' + all[i]).style.display = (all[i] === name) ? 'block' : 'none'; }
+}
+
+// Called by the host with a JSON string (see Get-ViewModel in Show-UpdateScreen.ps1).
+function updateStatus(json) {
+    var s;
+    try { s = JSON.parse(json); } catch (e) { return; }
+    var cls = 'running', icon = 'Running', title, sub, warn, warnSmall, showWarn = true;
+    var rebooting = s.RebootInSec !== null && s.RebootInSec !== undefined;
+    var restartText = rebooting
+        ? (s.RebootInSec > 0 ? 'The controller restarts in ' + s.RebootInSec + ' s.' : 'The controller is restarting now...')
+        : '';
+
+    if (s.Phase === 'waiting') {
+        title = 'Preparing system update'; sub = 'Please wait.';
+        warn = 'Do not switch off the power or remove the USB stick.';
+        warnSmall = 'The machine will restart by itself when the update is finished.';
+    } else if (s.Phase === 'running') {
+        title = 'System update in progress';
+        sub = s.StepKey === 'rollback' ? 'A problem was found. The previous version is being restored.' : 'The machine is being updated. This can take several minutes.';
+        warn = 'Do not switch off the power or remove the USB stick.';
+        warnSmall = 'The machine will restart by itself when the update is finished.';
+    } else if (s.State === 'Success') {
+        cls = 'success'; icon = 'Success'; title = 'Update complete';
+        sub = rebooting ? restartText : 'The machine is ready.';
+        warn = 'Do not switch off the power.'; warnSmall = 'Wait until the controller has restarted.';
+        showWarn = rebooting;
+    } else if (s.State === 'Failed') {
+        cls = 'warning'; icon = 'Warning'; title = 'Update not applied';
+        sub = 'Nothing on this machine was changed. It keeps running the current version.';
+        showWarn = false;
+    } else if (s.State === 'RolledBack') {
+        cls = 'warning'; icon = 'Warning'; title = 'Update failed - previous version restored';
+        sub = rebooting ? restartText : 'The machine is running the previous version again.';
+        warn = 'Do not switch off the power.'; warnSmall = 'Wait until the controller has restarted.';
+        showWarn = rebooting;
+    } else {   // RollbackFailed
+        cls = 'error'; icon = 'Error'; title = 'Update failed - service needed';
+        sub = 'The previous version could not be restored. TwinCAT has been left stopped.';
+        warn = 'Do not switch off the power. Contact maintenance.';
+        warnSmall = 'The backup of the previous version is kept on this machine (see the update log).';
+    }
+
+    document.body.className = 'st-' + cls;
+    setIcon(icon);
+    setText('title', title);
+    setText('sub', sub);
+    showAs('warn', showWarn, 'block');
+    if (showWarn) { setText('warnText', warn); setText('warnSmall', warnSmall); }
+
+    var pct = Math.max(0, Math.min(100, Math.round(s.Percent || 0)));
+    el('fill').style.width = pct + '%';
+    setText('pct', pct + ' %');
+    setText('step', s.Phase === 'final' ? (s.State === 'Success' ? 'Finished' : 'Stopped at: ' + (s.Step || '')) : (s.Step || 'Starting...'));
+    setText('detail', s.Phase === 'running' ? s.Detail : '');
+    renderSteps(s);
+
+    showAs('error', !!s.ErrorText && s.Phase === 'final' && s.State !== 'Success', 'block');
+    setText('error', s.ErrorText);
+
+    showAs('closeBtn', !!s.CanClose, 'inline-block');
+    var ac = s.AutoCloseInSec !== null && s.AutoCloseInSec !== undefined;
+    showAs('autoclose', ac, 'inline');
+    if (ac) { setText('autoclose', 'This screen closes in ' + s.AutoCloseInSec + ' s'); }
+
+    var right = 'Elapsed ' + fmtTime(s.ElapsedSec);
+    if (s.Phase === 'running' && s.StaleSec >= 30) {
+        el('footRight').className = 'right stale';
+        right = 'No progress reported for ' + fmtTime(s.StaleSec) + ' - still working, please wait. ' + right;
+    } else {
+        el('footRight').className = 'right';
+    }
+    setText('footRight', right);
+    setText('footLeft', (s.ComputerName || '') + '  -  TwinCAT update');
+}
+</script>
+</body>
+</html>

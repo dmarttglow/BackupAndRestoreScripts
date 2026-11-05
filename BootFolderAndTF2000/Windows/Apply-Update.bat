@@ -24,5 +24,9 @@ if errorlevel 1 (
     exit /b
 )
 
+:: Optional status screen (UpdateScreen\Install-UpdateScreen.bat). If the task is
+:: not installed this does nothing, and the update never waits for or needs it.
+schtasks.exe /Run /TN "TwinCAT Update Screen" >nul 2>&1
+
 powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0scripts\Install-UpdatePackage.ps1" %*
 exit /b %ERRORLEVEL%

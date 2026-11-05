@@ -20,7 +20,8 @@ $AdsSystemServicePort = 10000
 # long steps visibly keep moving. Console only - never written to the log.
 # Redraws at most 4x per second unless -Force. Silently does nothing without a console.
 function Write-ProgressLine {
-    param([Parameter(Mandatory = $true)][string]$Text, [switch]$Force)
+    param([Parameter(Mandatory = $true)][string]$Text, [switch]$Force, [int]$Percent = -1)
+    Update-ProgressDetail -Detail $Text -Percent $Percent
     $now = [DateTime]::UtcNow
     if (-not $Force -and ($now - $script:ProgressLastDraw).TotalMilliseconds -lt 250) { return }
     $script:ProgressLastDraw = $now
@@ -31,6 +32,89 @@ function Write-ProgressLine {
         if ($line.Length -gt $width) { $line = $line.Substring(0, $width) }
         [Console]::Write("`r" + $line.PadRight($width))
         $script:ProgressShown = $true
+    } catch { }
+}
+
+# -----------------------------------------------------------------------------
+#  Progress file for the optional status screen (UpdateScreen\)
+#  Nothing here needs the screen: until Start-ProgressFile is called these
+#  functions do nothing, and any error writing the file is ignored.
+# -----------------------------------------------------------------------------
+
+$script:ProgressFile = $null
+$script:ProgressState = $null
+$script:ProgressLastWrite = [DateTime]::MinValue
+
+function Start-ProgressFile {
+    param([Parameter(Mandatory = $true)][string]$Path, [string]$RunId)
+    $script:ProgressFile = $Path
+    $script:ProgressState = [ordered]@{
+        RunId        = $RunId
+        ComputerName = $env:COMPUTERNAME
+        State        = 'Running'   # Running, Success, Failed, RolledBack, RollbackFailed
+        StepKey      = ''
+        Step         = 'Preparing update'
+        Detail       = ''
+        Percent      = 0
+        StepStart    = 0
+        StepEnd      = 0
+        ErrorText    = ''
+        RebootAtUtc  = $null
+        StartedUtc   = [DateTime]::UtcNow.ToString('o')
+        UpdatedUtc   = $null
+    }
+    Save-ProgressFile -Force
+}
+
+# Starts a step that covers Start..End of the overall progress (0-100).
+function Set-ProgressStep {
+    param([string]$Key, [string]$Text, [int]$Start, [int]$End)
+    $s = $script:ProgressState
+    if (-not $s) { return }
+    $s.StepKey = $Key; $s.Step = $Text; $s.Detail = ''
+    $s.StepStart = $Start; $s.StepEnd = $End; $s.Percent = $Start
+    Save-ProgressFile -Force
+}
+
+# Percent is within the current step (0-100), or -1 if unknown.
+function Update-ProgressDetail {
+    param([string]$Detail, [int]$Percent = -1)
+    $s = $script:ProgressState
+    if (-not $s) { return }
+    $s.Detail = $Detail
+    if ($Percent -ge 0) {
+        # A step can hash several folders one after another: never move the bar backwards.
+        $p = [int]($s.StepStart + ($s.StepEnd - $s.StepStart) * [Math]::Min(100, $Percent) / 100)
+        if ($p -gt $s.Percent) { $s.Percent = $p }
+    }
+    Save-ProgressFile
+}
+
+function Set-ProgressResult {
+    param([string]$State, [string]$ErrorText, [int]$RebootInSec = -1)
+    $s = $script:ProgressState
+    if (-not $s) { return }
+    $s.State = $State
+    $s.Detail = ''
+    if ($ErrorText) { $s.ErrorText = $ErrorText }
+    if ($State -eq 'Success') { $s.Percent = 100 }
+    if ($RebootInSec -ge 0) { $s.RebootAtUtc = [DateTime]::UtcNow.AddSeconds($RebootInSec).ToString('o') }
+    Save-ProgressFile -Force
+}
+
+# Writes the state as JSON at most once per second (always with -Force).
+function Save-ProgressFile {
+    param([switch]$Force)
+    if (-not $script:ProgressFile -or -not $script:ProgressState) { return }
+    $now = [DateTime]::UtcNow
+    if (-not $Force -and ($now - $script:ProgressLastWrite).TotalMilliseconds -lt 1000) { return }
+    $script:ProgressLastWrite = $now
+    try {
+        $script:ProgressState.UpdatedUtc = $now.ToString('o')
+        $tmp = "$($script:ProgressFile).tmp"
+        [IO.File]::WriteAllText($tmp, ($script:ProgressState | ConvertTo-Json -Compress), (New-Object Text.UTF8Encoding $false))
+        if ([IO.File]::Exists($script:ProgressFile)) { [IO.File]::Delete($script:ProgressFile) }
+        [IO.File]::Move($tmp, $script:ProgressFile)
     } catch { }
 }
 
@@ -196,7 +280,7 @@ function Get-FolderInventory {
         $i++
         if (-not $NoHash) {
             $pct = if ($totalBytes) { [int](100 * $doneBytes / $totalBytes) } else { 100 }
-            Write-ProgressLine ("{0}: {1}/{2} files, {3:N1}/{4:N1} MB ({5}%)  {6}" -f $Activity, $i, $files.Count, ($doneBytes / 1MB), ($totalBytes / 1MB), $pct, (Format-Elapsed $sw))
+            Write-ProgressLine ("{0}: {1}/{2} files, {3:N1}/{4:N1} MB ({5}%)  {6}" -f $Activity, $i, $files.Count, ($doneBytes / 1MB), ($totalBytes / 1MB), $pct, (Format-Elapsed $sw)) -Percent $pct
         }
         [pscustomobject][ordered]@{
             Path   = $f.FullName.Substring($rootFull.Length).TrimStart('\')
@@ -308,6 +392,105 @@ function New-FolderSnapshot {
     $manifest
 }
 
+# -----------------------------------------------------------------------------
+#  Zip archive (the package travels on the USB stick as a single .zip file)
+# -----------------------------------------------------------------------------
+
+function Initialize-Zip {
+    try {
+        Add-Type -AssemblyName System.IO.Compression -ErrorAction Stop
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+    } catch {
+        throw 'Zip support (System.IO.Compression, .NET Framework 4.5 or newer) is not available on this system.'
+    }
+}
+
+# Packs everything under Folder into ZipPath (overwritten). Empty folders are kept.
+function Compress-Folder {
+    param([Parameter(Mandatory = $true)][string]$Folder, [Parameter(Mandatory = $true)][string]$ZipPath)
+    Initialize-Zip
+    $root = Get-NormalizedPath $Folder
+    if (Test-Path -LiteralPath $ZipPath) { Remove-Item -LiteralPath $ZipPath -Force }
+    $files = @(Get-ChildItem -LiteralPath $root -Recurse -Force -File)
+    $dirs = @(Get-ChildItem -LiteralPath $root -Recurse -Force -Directory)
+    $totalBytes = [long]0
+    foreach ($f in $files) { $totalBytes += $f.Length }
+
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $doneBytes = [long]0
+    $i = 0
+    $zip = [IO.Compression.ZipFile]::Open($ZipPath, [IO.Compression.ZipArchiveMode]::Create)
+    try {
+        foreach ($d in $dirs) {
+            [void]$zip.CreateEntry($d.FullName.Substring($root.Length).TrimStart('\').Replace('\', '/') + '/')
+        }
+        foreach ($f in $files) {
+            $i++
+            $pct = if ($totalBytes) { [int](100 * $doneBytes / $totalBytes) } else { 100 }
+            Write-ProgressLine ("Zipping: {0}/{1} files, {2:N1}/{3:N1} MB ({4}%)  {5}" -f $i, $files.Count, ($doneBytes / 1MB), ($totalBytes / 1MB), $pct, (Format-Elapsed $sw)) -Percent $pct
+            $name = $f.FullName.Substring($root.Length).TrimStart('\').Replace('\', '/')
+            [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $f.FullName, $name, [IO.Compression.CompressionLevel]::Optimal)
+            $doneBytes += $f.Length
+        }
+    } finally {
+        $zip.Dispose()
+        Clear-ProgressLine
+    }
+    Write-Log ("Zipped {0} files in {1}: {2:N1} MB -> {3:N1} MB" -f $files.Count, (Format-Elapsed $sw), ($totalBytes / 1MB), ((Get-Item -LiteralPath $ZipPath).Length / 1MB))
+}
+
+# Total uncompressed size of all entries in a zip file.
+function Get-ZipContentSize {
+    param([Parameter(Mandatory = $true)][string]$ZipPath)
+    Initialize-Zip
+    $zip = [IO.Compression.ZipFile]::OpenRead($ZipPath)
+    try {
+        $bytes = [long]0
+        foreach ($e in $zip.Entries) { $bytes += $e.Length }
+        $bytes
+    } finally { $zip.Dispose() }
+}
+
+# Extracts ZipPath into Destination (which must not exist yet). Refuses entries
+# that would land outside Destination.
+function Expand-ZipFile {
+    param([Parameter(Mandatory = $true)][string]$ZipPath, [Parameter(Mandatory = $true)][string]$Destination)
+    Initialize-Zip
+    $root = Get-NormalizedPath $Destination
+    New-Item -ItemType Directory -Path $root -Force | Out-Null
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $zip = [IO.Compression.ZipFile]::OpenRead($ZipPath)
+    try {
+        $entries = @($zip.Entries)
+        $totalBytes = [long]0
+        foreach ($e in $entries) { $totalBytes += $e.Length }
+        $doneBytes = [long]0
+        $i = 0
+        foreach ($e in $entries) {
+            $i++
+            $pct = if ($totalBytes) { [int](100 * $doneBytes / $totalBytes) } else { 100 }
+            Write-ProgressLine ("Unzipping: {0}/{1} entries, {2:N1}/{3:N1} MB ({4}%)  {5}" -f $i, $entries.Count, ($doneBytes / 1MB), ($totalBytes / 1MB), $pct, (Format-Elapsed $sw)) -Percent $pct
+            $rel = $e.FullName.Replace('/', '\')
+            $target = [IO.Path]::GetFullPath((Join-Path $root $rel))
+            if (-not $target.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) {
+                throw "Zip entry '$($e.FullName)' points outside the extraction folder."
+            }
+            if ($rel.EndsWith('\')) {
+                New-Item -ItemType Directory -Path $target -Force | Out-Null
+                continue
+            }
+            $dir = Split-Path -Parent $target
+            if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+            [IO.Compression.ZipFileExtensions]::ExtractToFile($e, $target, $true)
+            $doneBytes += $e.Length
+        }
+    } finally {
+        $zip.Dispose()
+        Clear-ProgressLine
+    }
+    Write-Log ("Unzipped {0} entries ({1:N1} MB) in {2}" -f $entries.Count, ($totalBytes / 1MB), (Format-Elapsed $sw))
+}
+
 function Read-Manifest {
     param([Parameter(Mandatory = $true)][string]$Folder)
     $path = Join-Path $Folder 'manifest.json'
@@ -334,7 +517,7 @@ function Compare-FolderToManifest {
     foreach ($f in $files) {
         $i++
         $pct = if ($totalBytes) { [int](100 * $doneBytes / $totalBytes) } else { 100 }
-        Write-ProgressLine ("{0}: {1}/{2} files, {3:N1}/{4:N1} MB ({5}%)  {6}" -f $Activity, $i, $files.Count, ($doneBytes / 1MB), ($totalBytes / 1MB), $pct, (Format-Elapsed $sw))
+        Write-ProgressLine ("{0}: {1}/{2} files, {3:N1}/{4:N1} MB ({5}%)  {6}" -f $Activity, $i, $files.Count, ($doneBytes / 1MB), ($totalBytes / 1MB), $pct, (Format-Elapsed $sw)) -Percent $pct
         $doneBytes += [long]$f.Size
         $p = Join-Path $Root $f.Path
         if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { $problems.Add("missing: $($f.Path)"); continue }

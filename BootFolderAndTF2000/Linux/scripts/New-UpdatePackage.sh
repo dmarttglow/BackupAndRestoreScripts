@@ -4,11 +4,11 @@
 #  on a USB stick.
 #
 #  1. Switches TwinCAT to Config mode via ADS and stops the TwinCAT HMI Server service.
-#  2. Copies the Boot folder and HMI Server folder into <USB>/TwinCAT_Update.partial,
-#     hashes every file (SHA-256) and writes manifest.txt.
-#  3. Renames the folder to <USB>/TwinCAT_Update (the previous package is kept as
-#     TwinCAT_Update_previous).
-#  4. Restarts the HMI Server and puts TwinCAT back into Run mode if it was running.
+#  2. Copies the Boot folder and HMI Server folder into a local build folder
+#     (/var/tmp), hashes every file (SHA-256) and writes manifest.txt.
+#  3. Restarts the HMI Server and puts TwinCAT back into Run mode if it was running.
+#  4. Compresses the build folder to <USB>/TwinCAT_Update/TwinCAT_Update.tar.gz (written
+#     as .partial first; the previous package is kept as TwinCAT_Update_previous.tar.gz).
 #
 #  Options:
 #    --destination <dir>  Mount point or folder in which to create the package folder.
@@ -64,24 +64,37 @@ TC_WAS_RUNNING=0
 RESTART_SERVICES=()
 ADS_USED=0
 
+RESTORE_FAILED=0
+BUILD_DIR=''
+
 fail() {
     (( $# )) && log_error "$*"
-    log_error 'Package NOT created. Any incomplete copy is left as *.partial and will never be used.'
+    log_error 'Package NOT created. Any incomplete archive is left as *.partial and will never be used.'
     exit 1
+}
+
+# Restarts what was stopped. Does its work once: right after the copy, or in finish on failure.
+restore_bench_state() {
+    local svc
+    if (( LEAVE_STOPPED )); then
+        (( ADS_USED )) && log_warn '--leave-stopped given: TwinCAT left in Config mode, HMI Server left stopped.'
+        ADS_USED=0
+        return 0
+    fi
+    for svc in "${RESTART_SERVICES[@]}"; do start_service_safe "$svc" "$SERVICE_STOP_TIMEOUT_SEC"; done
+    RESTART_SERVICES=()
+    if (( TC_WAS_RUNNING )); then
+        TC_WAS_RUNNING=0
+        set_twincat_mode Run "$ADS_STATE_TIMEOUT_SEC" || { log_warn 'Could not return TwinCAT to Run mode.'; RESTORE_FAILED=1; }
+    fi
 }
 
 finish() {
     trap '' INT TERM
     trap - EXIT
-    local svc
-    if (( ! LEAVE_STOPPED )); then
-        for svc in "${RESTART_SERVICES[@]}"; do start_service_safe "$svc" "$SERVICE_STOP_TIMEOUT_SEC"; done
-        if (( TC_WAS_RUNNING )); then
-            set_twincat_mode Run "$ADS_STATE_TIMEOUT_SEC" || { log_warn 'Could not return TwinCAT to Run mode.'; EXIT_CODE=1; }
-        fi
-    elif (( ADS_USED )); then
-        log_warn '--leave-stopped given: TwinCAT left in Config mode, HMI Server left stopped.'
-    fi
+    restore_bench_state
+    (( RESTORE_FAILED )) && EXIT_CODE=1
+    [[ -n $BUILD_DIR ]] && rm -rf -- "$BUILD_DIR"
     LOG_FILE=''
     unmount_usb_drives
     exit "$EXIT_CODE"
@@ -93,18 +106,33 @@ assert_prerequisites || fail
 import_update_config "$CONFIG_PATH" || fail
 
 resolve_package_destination || fail
-PKG_FINAL="$DEST_ROOT/$PACKAGE_FOLDER_NAME"
-PKG_TEMP="$PKG_FINAL.partial"
-PKG_PREV="${PKG_FINAL}_previous"
+PKG_DIR="$DEST_ROOT/$PACKAGE_FOLDER_NAME"
+ARCHIVE_FINAL="$PKG_DIR/$PACKAGE_FOLDER_NAME.tar.gz"
+ARCHIVE_TEMP="$ARCHIVE_FINAL.partial"
+ARCHIVE_PREV="$PKG_DIR/${PACKAGE_FOLDER_NAME}_previous.tar.gz"
+LOG_FINAL="$PKG_DIR/create.log"
+LOG_TEMP="$PKG_DIR/create.partial.log"
 
-rm -rf -- "$PKG_TEMP" && mkdir -p -- "$PKG_TEMP" || fail "Could not create '$PKG_TEMP'."
-start_log "$PKG_TEMP/create.log"
+# An uncompressed package from an older version of this tool: keep it as <folder>_previous.
+OLD_STYLE=0
+if [[ -f $PKG_DIR/manifest.txt ]]; then
+    OLD_STYLE=1
+    { rm -rf -- "${PKG_DIR}_previous" && mv -- "$PKG_DIR" "${PKG_DIR}_previous"; } ||
+        fail "Could not move the old package to '${PKG_DIR}_previous'."
+fi
+mkdir -p -- "$PKG_DIR" && rm -f -- "$LOG_TEMP" || fail "Could not create '$PKG_DIR'."
+start_log "$LOG_TEMP"
 
 log_step '=== Create TwinCAT update package (bench) ==='
 log "Running as $(id -un) on $(uname -n)"
+(( OLD_STYLE )) && log "Uncompressed package from an older version moved to ${PKG_DIR}_previous"
 get_twincat_info
 log "TwinCAT version: $TC_VERSION   AMS Net ID: $TC_AMS_NET_ID"
-log "Package folder:  $PKG_FINAL"
+log "Package file:    $ARCHIVE_FINAL"
+
+BUILD_DIR="/var/tmp/${PACKAGE_FOLDER_NAME}_build"
+rm -rf -- "$BUILD_DIR" && mkdir -p -- "$BUILD_DIR" || fail "Could not create '$BUILD_DIR'."
+log "Build folder:    $BUILD_DIR"
 
 # --- Record installed versions (checked by Apply-Update on the machine) -------
 declare -A VERSIONS=()
@@ -113,7 +141,7 @@ for k in "${VERSION_KEYS[@]}"; do
     [[ -n ${VERSIONS[$k]} ]] || fail "Could not read the installed $k version on this bench system (check XAR_PACKAGES / HMI_PACKAGES in Config.sh)."
     log "$(printf 'Version %-18s %s' "$k" "${VERSIONS[$k]}")"
 done
-write_version_file "$PKG_TEMP/versions.txt" VERSIONS || fail "Could not write $PKG_TEMP/versions.txt"
+write_version_file "$BUILD_DIR/versions.txt" VERSIONS || fail "Could not write $BUILD_DIR/versions.txt"
 
 # --- Resolve source folders -------------------------------------------------
 ENTRY_NAMES=()
@@ -143,9 +171,12 @@ for name in "${ENTRY_NAMES[@]}"; do
     folder_inventory "${ENTRY_PATH[$name]}" "XF_$name" "XD_$name"
     (( needed += INV_BYTES ))
 done
-free=$(free_bytes "$PKG_TEMP")
-log "Package size: $(format_mb "$needed") MB, free on destination: $(format_mb "${free:-0}") MB"
+# The archive is never much bigger than the files, so the same margin covers both drives.
+free=$(free_bytes "$PKG_DIR")
+free_build=$(free_bytes "$BUILD_DIR")
+log "Package size: $(format_mb "$needed") MB, free on destination: $(format_mb "${free:-0}") MB, free for build folder: $(format_mb "${free_build:-0}") MB"
 (( ${free:-0} >= needed * 11 / 10 + 10 * 1048576 )) || fail 'Not enough free space on the destination drive.'
+(( ${free_build:-0} >= needed * 11 / 10 + 10 * 1048576 )) || fail "Not enough free space for the build folder $BUILD_DIR."
 
 # --- Stop TwinCAT runtime + HMI Server ---------------------------------------
 if (( NO_STOP )); then
@@ -162,15 +193,21 @@ else
 fi
 
 # --- Copy + hash ------------------------------------------------------------
-new_folder_snapshot "$PKG_TEMP" UpdatePackage package 1 || fail
+new_folder_snapshot "$BUILD_DIR" UpdatePackage package 1 || fail
+restore_bench_state   # copy done: TwinCAT and the HMI Server can run again while compressing
+
+# --- Compress onto the stick ---------------------------------------------------
+log_step "Compressing package to $ARCHIVE_TEMP"
+compress_folder "$BUILD_DIR" "$ARCHIVE_TEMP" || fail
 
 # --- Publish: .partial -> final (keep one previous package) -------------------
-if [[ -e $PKG_FINAL ]]; then
-    { rm -rf -- "$PKG_PREV" && mv -- "$PKG_FINAL" "$PKG_PREV"; } || fail "Could not move the old package to '$PKG_PREV'."
-    log "Previous package kept as $PKG_PREV"
+if [[ -e $ARCHIVE_FINAL ]]; then
+    mv -f -- "$ARCHIVE_FINAL" "$ARCHIVE_PREV" || fail "Could not move the old package to '$ARCHIVE_PREV'."
+    log "Previous package kept as $ARCHIVE_PREV"
 fi
-mv -- "$PKG_TEMP" "$PKG_FINAL" || fail "Could not rename '$PKG_TEMP' to '$PKG_FINAL'."
-LOG_FILE="$PKG_FINAL/create.log"
+mv -- "$ARCHIVE_TEMP" "$ARCHIVE_FINAL" || fail "Could not rename '$ARCHIVE_TEMP' to '$ARCHIVE_FINAL'."
+[[ -e $LOG_FINAL ]] && mv -f -- "$LOG_FINAL" "$PKG_DIR/create_previous.log"
+mv -f -- "$LOG_TEMP" "$LOG_FINAL" && LOG_FILE=$LOG_FINAL
 
 for name in "${ENTRY_NAMES[@]}"; do
     log_ok "$(printf '  %-6s %6d files  %10s MB' "$name" "${SNAP_COUNT[$name]}" "$(format_mb "${SNAP_BYTES[$name]}")")"
