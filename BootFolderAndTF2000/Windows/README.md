@@ -2,7 +2,7 @@
 
 | Where | Run | What it does |
 |---|---|---|
-| **Bench system** | `Create-UpdatePackage.bat` | Uses ADS to switch TwinCAT to Config mode and stops the HMI Server (`TcHmiSrv`). Copies the Boot folder and HMI Server folder to a local build folder with a SHA-256 manifest, restarts both, then zips the package to `<USB>:\TwinCAT_Update\TwinCAT_Update.zip`. |
+| **Bench system** | `Create-UpdatePackage.bat` | Uses ADS to switch TwinCAT to Config mode and stops the HMI Server (`TcHmiSrv`). Copies the Boot folder and HMI Server folder to a local build folder with a SHA-256 manifest, restarts both, then zips the package to a single file, `<USB>:\TwinCAT_Update.zip`. |
 | **Machine IPC** | `Apply-Update.bat` (started by the PLC) | Finds the zip on the USB stick, unzips it to a local staging folder and verifies it. Uses ADS to switch to Config mode and stops the HMI Server. Backs up the old version, replaces the folders, verifies them, rolls back if anything fails, then reboots. |
 
 ```
@@ -23,7 +23,7 @@ UpdateScreen\                                 optional "update in progress" scre
    ```powershell
    Get-ChildItem 'C:\TwinCAT','C:\Program Files (x86)\Beckhoff' -Recurse -Filter TwinCAT.Ads.dll -EA 0 | Select FullName
    ```
-3. **On each machine**, copy this whole folder to a fixed local path, for example `C:\TwinCAT_UpdateTool\`. The PLC needs a path that doesn't depend on the USB drive letter. The USB stick only needs to hold the `TwinCAT_Update` package folder.
+3. **On each machine**, copy this whole folder to a fixed local path, for example `C:\TwinCAT_UpdateTool\`. The PLC needs a path that doesn't depend on the USB drive letter. The USB stick only needs to hold `TwinCAT_Update.zip`.
 
 ## PLC trigger (Tc2_Utilities `NT_StartProcess`)
 
@@ -80,7 +80,7 @@ Both launchers pass anything after them straight to their script, e.g. `Apply-Up
 |---|---|
 | `-AllowVersionMismatch` | Applies the package even if the XAR / TF2000 versions differ from this machine. The mismatch is still logged. Manual use only. |
 | `-NoReboot` | Doesn't reboot at the end. Restarts the HMI Server and puts TwinCAT back into Run mode instead. |
-| `-PackagePath <zip or folder>` | Uses this package zip (or the folder holding it) instead of searching all drives for `\TwinCAT_Update\TwinCAT_Update.zip`. Needed if more than one drive holds a package. An unzipped package folder from an older version of the scripts also works. |
+| `-PackagePath <zip or folder>` | Uses this package zip (or the folder holding it) instead of searching all drives for `\TwinCAT_Update.zip`. Needed if more than one drive holds a package. An unzipped package folder from an older version of the scripts also works. |
 | `-ConfigPath <file>` | Uses a different config file instead of `Config.ps1`. |
 
 **`Create-UpdatePackage.bat` (bench)**
@@ -97,7 +97,7 @@ Set the environment variable `NOPAUSE=1` to stop `Create-UpdatePackage.bat` wait
 ## Result and logs (machine)
 
 - `C:\TwinCAT_UpdateBackups\last_update_status.txt`: `SUCCESS` / `FAILED - nothing changed` / `FAILED - previous version restored` / `FAILED - ROLLBACK FAILED`
-- `C:\TwinCAT_UpdateBackups\Logs\Apply_<time>.log`. A copy also goes to `<USB>:\TwinCAT_Update\Logs\`.
+- `C:\TwinCAT_UpdateBackups\Logs\Apply_<time>.log`. A copy also goes to `<USB>:\TwinCAT_Update_Logs\`.
 - `C:\TwinCAT_UpdateBackups\<time>_before_update\`: the old Boot and HMI folders. The last 5 are kept (`BackupsToKeep`).
 
 Exit codes: 0 ok, 1 failed (nothing changed), 2 failed and rolled back, 3 rollback failed (the IPC is left in Config mode and **not** rebooted), 4 already running.
@@ -110,5 +110,5 @@ Exit codes: 0 ok, 1 failed (nothing changed), 2 failed and rolled back, 3 rollba
 - **Mirror copy.** The target folders end up exactly like the package. Stale files are removed, except excluded files, which are left alone.
 - **Version check (exact match).** The bench writes `versions.json` into the package. It records the TwinCAT XAR version (registry `TcVersion`, e.g. `3.1.4026.27`) and the TF2000 HMI Server version (ProductVersion of the exe the `TcHmiSrv` service runs, e.g. `25.0.122`). Apply-Update reads the same values on the machine. If either differs, or can't be read, it stops with an error **before anything is stopped or changed**, and both versions are written to the log. The bench refuses to build a package if it can't read either version. Running `Apply-Update.bat -AllowVersionMismatch` by hand overrides the check; the PLC trigger never does.
 - **Hardware binding.** The Boot folder holds the bench's I/O configuration. EtherCAT adapters are bound to a MAC address or PCI slot, so the bench and machines should be the same IPC model and use the same adapter binding. Licences are not part of the Boot folder and don't move with it.
-- **Zipped package.** The stick holds `TwinCAT_Update\TwinCAT_Update.zip` (Boot, HMI, `manifest.json`, `versions.json` inside), plus `create.log` and the `Logs\` folder. The bench builds the package in `%TEMP%\TwinCAT_Update_build` and restarts TwinCAT and the HMI Server *before* zipping, so the downtime is only the copy. The machine unzips to `C:\TwinCAT_UpdateBackups\Staging`, checks every file's SHA-256 there, and deletes the staging folder at the end. Needs .NET Framework 4.5 or newer (part of every TwinCAT 3 install).
-- Incomplete zips are written as `TwinCAT_Update.zip.partial` and are never picked up. The previous package on the stick is kept as `TwinCAT_Update_previous.zip` (and its log as `create_previous.log`). An unzipped `TwinCAT_Update` folder from an older version of the scripts is moved to `TwinCAT_Update_previous` the first time the new version builds a package.
+- **Zipped package.** The package is one file at the root of the stick, `TwinCAT_Update.zip` (Boot, HMI, `manifest.json`, `versions.json` inside). Next to it are the bench log `TwinCAT_Update_create.log` and, once a machine has run the update, the `TwinCAT_Update_Logs\` folder. The bench builds the package in `%TEMP%\TwinCAT_Update_build` and restarts TwinCAT and the HMI Server *before* zipping, so the downtime is only the copy. The machine unzips to `C:\TwinCAT_UpdateBackups\Staging`, checks every file's SHA-256 there, and deletes the staging folder at the end. Needs .NET Framework 4.5 or newer (part of every TwinCAT 3 install).
+- Incomplete zips are written as `TwinCAT_Update.zip.partial` and are never picked up. The previous package on the stick is kept as `TwinCAT_Update_previous.zip` (and its log as `TwinCAT_Update_create_previous.log`). A `TwinCAT_Update` folder from an older version of the scripts is renamed to `TwinCAT_Update_old` the first time the new version builds a package (it can be deleted). Apply-Update still accepts packages in the older layouts.

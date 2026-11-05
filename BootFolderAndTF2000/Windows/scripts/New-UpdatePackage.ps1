@@ -7,11 +7,12 @@
     2. Copies the Boot folder and HMI Server folder into a local build folder (%TEMP%),
        hashes every file (SHA-256) and writes manifest.json.
     3. Restarts the HMI Server and puts TwinCAT back into Run mode if it was running.
-    4. Zips the build folder to <USB>\TwinCAT_Update\TwinCAT_Update.zip (written as .partial
-       first; the previous package is kept as TwinCAT_Update_previous.zip).
+    4. Zips the build folder to a single file, <USB>\TwinCAT_Update.zip (written as .partial
+       first; the previous package is kept as TwinCAT_Update_previous.zip). The bench log is
+       written next to it as TwinCAT_Update_create.log.
 
 .PARAMETER Destination
-    Drive or folder in which to create the package folder (e.g. E:\).
+    Drive or folder in which to create the package zip (e.g. E:\).
     Default: the removable drive this script runs from, or the only removable drive present.
 
 .PARAMETER NoStop
@@ -77,28 +78,30 @@ try {
 
     Initialize-Zip
     $destRoot = Resolve-PackageDestination $Destination
-    $pkgDir = Join-Path $destRoot $S.PackageFolderName
-    $zipFinal = Join-Path $pkgDir "$($S.PackageFolderName).zip"
+    # The package is a single zip at the root of the stick, with its log next to it.
+    $pkgName = $S.PackageFolderName
+    $zipFinal = Join-Path $destRoot "$pkgName.zip"
     $zipTemp = "$zipFinal.partial"
-    $zipPrev = Join-Path $pkgDir "$($S.PackageFolderName)_previous.zip"
-    $logFinal = Join-Path $pkgDir 'create.log'
-    $logTemp = Join-Path $pkgDir 'create.partial.log'
+    $zipPrev = Join-Path $destRoot "${pkgName}_previous.zip"
+    $logFinal = Join-Path $destRoot "${pkgName}_create.log"
+    $logPrev = Join-Path $destRoot "${pkgName}_create_previous.log"
+    $logTemp = Join-Path $destRoot "${pkgName}_create.partial.log"
 
-    # An unzipped package from an older version of this tool: keep it as <folder>_previous.
-    $oldStyle = $false
-    if (Test-Path -LiteralPath (Join-Path $pkgDir 'manifest.json') -PathType Leaf) {
-        $oldStyle = $true
-        $pkgPrev = "$($pkgDir)_previous"
-        if (Test-Path -LiteralPath $pkgPrev) { Remove-Item -LiteralPath $pkgPrev -Recurse -Force }
-        Rename-Item -LiteralPath $pkgDir -NewName (Split-Path -Leaf $pkgPrev)
+    # A <name> package folder from an older version of this tool would also be picked up by
+    # Apply-Update: move it out of the way as <name>_old.
+    $oldDir = Join-Path $destRoot $pkgName
+    $oldMoved = $null
+    if (Test-Path -LiteralPath $oldDir -PathType Container) {
+        $oldMoved = "${oldDir}_old"
+        if (Test-Path -LiteralPath $oldMoved) { Remove-Item -LiteralPath $oldMoved -Recurse -Force }
+        Rename-Item -LiteralPath $oldDir -NewName (Split-Path -Leaf $oldMoved)
     }
-    New-Item -ItemType Directory -Path $pkgDir -Force | Out-Null
     if (Test-Path -LiteralPath $logTemp) { Remove-Item -LiteralPath $logTemp -Force }
     Start-Log $logTemp
 
     Write-Log -Level STEP '=== Create TwinCAT update package (bench) ==='
     Write-Log "Running as $([Security.Principal.WindowsIdentity]::GetCurrent().Name) on $env:COMPUTERNAME"
-    if ($oldStyle) { Write-Log "Unzipped package from an older version moved to $pkgPrev" }
+    if ($oldMoved) { Write-Log -Level WARN "Package folder from an older version moved to $oldMoved (can be deleted)" }
     $tc = Get-TwinCATInfo
     Write-Log "TwinCAT version: $($tc.Version)   AMS Net ID: $($tc.AmsNetId)"
     Write-Log "Package file:    $zipFinal"
@@ -172,12 +175,12 @@ try {
         Write-Log "Previous package kept as $zipPrev"
     }
     Rename-Item -LiteralPath $zipTemp -NewName (Split-Path -Leaf $zipFinal)
-    if (Test-Path -LiteralPath $logFinal) { Move-Item -LiteralPath $logFinal -Destination (Join-Path $pkgDir 'create_previous.log') -Force }
+    if (Test-Path -LiteralPath $logFinal) { Move-Item -LiteralPath $logFinal -Destination $logPrev -Force }
     Move-Item -LiteralPath $logTemp -Destination $logFinal -Force
     $script:LogFile = $logFinal
 
     foreach ($i in $manifest.Items) { Write-Log -Level OK ("  {0,-6} {1,6} files  {2,10:N1} MB" -f $i.Name, $i.FileCount, ($i.TotalBytes / 1MB)) }
-    Write-Log -Level OK "Package created: $pkgFinal"
+    Write-Log -Level OK "Package created: $zipFinal"
     $exitCode = 0
 }
 catch {

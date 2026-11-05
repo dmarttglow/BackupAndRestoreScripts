@@ -7,11 +7,12 @@
 #  2. Copies the Boot folder and HMI Server folder into a local build folder
 #     (/var/tmp), hashes every file (SHA-256) and writes manifest.txt.
 #  3. Restarts the HMI Server and puts TwinCAT back into Run mode if it was running.
-#  4. Compresses the build folder to <USB>/TwinCAT_Update/TwinCAT_Update.tar.gz (written
-#     as .partial first; the previous package is kept as TwinCAT_Update_previous.tar.gz).
+#  4. Compresses the build folder to a single file, <USB>/TwinCAT_Update.tar.gz (written as
+#     .partial first; the previous package is kept as TwinCAT_Update_previous.tar.gz). The
+#     bench log is written next to it as TwinCAT_Update_create.log.
 #
 #  Options:
-#    --destination <dir>  Mount point or folder in which to create the package folder.
+#    --destination <dir>  Mount point or folder in which to create the package archive.
 #                         Default: the USB drive this script runs from, or the only USB drive present.
 #    --config <file>      Use a different config file instead of Config.sh.
 #    --no-stop            Do not stop TwinCAT / the HMI Server before copying (not recommended).
@@ -35,7 +36,7 @@ while (( $# )); do
         --config=*) CONFIG_PATH=${1#*=} ;;
         --no-stop) NO_STOP=1 ;;
         --leave-stopped) LEAVE_STOPPED=1 ;;
-        -h|--help) sed -n '3,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '3,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "Unknown argument: $1 (see --help)" >&2; exit 1 ;;
     esac
     shift
@@ -106,26 +107,29 @@ assert_prerequisites || fail
 import_update_config "$CONFIG_PATH" || fail
 
 resolve_package_destination || fail
-PKG_DIR="$DEST_ROOT/$PACKAGE_FOLDER_NAME"
-ARCHIVE_FINAL="$PKG_DIR/$PACKAGE_FOLDER_NAME.tar.gz"
+# The package is a single archive at the root of the stick, with its log next to it.
+ARCHIVE_FINAL="$DEST_ROOT/$PACKAGE_FOLDER_NAME.tar.gz"
 ARCHIVE_TEMP="$ARCHIVE_FINAL.partial"
-ARCHIVE_PREV="$PKG_DIR/${PACKAGE_FOLDER_NAME}_previous.tar.gz"
-LOG_FINAL="$PKG_DIR/create.log"
-LOG_TEMP="$PKG_DIR/create.partial.log"
+ARCHIVE_PREV="$DEST_ROOT/${PACKAGE_FOLDER_NAME}_previous.tar.gz"
+LOG_FINAL="$DEST_ROOT/${PACKAGE_FOLDER_NAME}_create.log"
+LOG_PREV="$DEST_ROOT/${PACKAGE_FOLDER_NAME}_create_previous.log"
+LOG_TEMP="$DEST_ROOT/${PACKAGE_FOLDER_NAME}_create.partial.log"
 
-# An uncompressed package from an older version of this tool: keep it as <folder>_previous.
-OLD_STYLE=0
-if [[ -f $PKG_DIR/manifest.txt ]]; then
-    OLD_STYLE=1
-    { rm -rf -- "${PKG_DIR}_previous" && mv -- "$PKG_DIR" "${PKG_DIR}_previous"; } ||
-        fail "Could not move the old package to '${PKG_DIR}_previous'."
+# A <name> package folder from an older version of this tool would also be picked up by
+# Apply-Update: move it out of the way as <name>_old.
+OLD_DIR="$DEST_ROOT/$PACKAGE_FOLDER_NAME"
+OLD_MOVED=''
+if [[ -d $OLD_DIR ]]; then
+    OLD_MOVED="${OLD_DIR}_old"
+    { rm -rf -- "$OLD_MOVED" && mv -- "$OLD_DIR" "$OLD_MOVED"; } ||
+        fail "Could not move the old package folder to '$OLD_MOVED'."
 fi
-mkdir -p -- "$PKG_DIR" && rm -f -- "$LOG_TEMP" || fail "Could not create '$PKG_DIR'."
+rm -f -- "$LOG_TEMP" || fail "Could not write to '$DEST_ROOT'."
 start_log "$LOG_TEMP"
 
 log_step '=== Create TwinCAT update package (bench) ==='
 log "Running as $(id -un) on $(uname -n)"
-(( OLD_STYLE )) && log "Uncompressed package from an older version moved to ${PKG_DIR}_previous"
+[[ -n $OLD_MOVED ]] && log_warn "Package folder from an older version moved to $OLD_MOVED (can be deleted)"
 get_twincat_info
 log "TwinCAT version: $TC_VERSION   AMS Net ID: $TC_AMS_NET_ID"
 log "Package file:    $ARCHIVE_FINAL"
@@ -172,7 +176,7 @@ for name in "${ENTRY_NAMES[@]}"; do
     (( needed += INV_BYTES ))
 done
 # The archive is never much bigger than the files, so the same margin covers both drives.
-free=$(free_bytes "$PKG_DIR")
+free=$(free_bytes "$DEST_ROOT")
 free_build=$(free_bytes "$BUILD_DIR")
 log "Package size: $(format_mb "$needed") MB, free on destination: $(format_mb "${free:-0}") MB, free for build folder: $(format_mb "${free_build:-0}") MB"
 (( ${free:-0} >= needed * 11 / 10 + 10 * 1048576 )) || fail 'Not enough free space on the destination drive.'
@@ -206,12 +210,12 @@ if [[ -e $ARCHIVE_FINAL ]]; then
     log "Previous package kept as $ARCHIVE_PREV"
 fi
 mv -- "$ARCHIVE_TEMP" "$ARCHIVE_FINAL" || fail "Could not rename '$ARCHIVE_TEMP' to '$ARCHIVE_FINAL'."
-[[ -e $LOG_FINAL ]] && mv -f -- "$LOG_FINAL" "$PKG_DIR/create_previous.log"
+[[ -e $LOG_FINAL ]] && mv -f -- "$LOG_FINAL" "$LOG_PREV"
 mv -f -- "$LOG_TEMP" "$LOG_FINAL" && LOG_FILE=$LOG_FINAL
 
 for name in "${ENTRY_NAMES[@]}"; do
     log_ok "$(printf '  %-6s %6d files  %10s MB' "$name" "${SNAP_COUNT[$name]}" "$(format_mb "${SNAP_BYTES[$name]}")")"
 done
 sync
-log_ok "Package created: $PKG_FINAL"
+log_ok "Package created: $ARCHIVE_FINAL"
 EXIT_CODE=0

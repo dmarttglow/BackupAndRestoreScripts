@@ -5,7 +5,7 @@
 #  (NT_StartProcess) from an HMI button.
 #
 #  Nothing on the machine is touched until the package has been fully validated.
-#  1. Finds <USB>/TwinCAT_Update/TwinCAT_Update.tar.gz and extracts it to <LOCAL_BACKUP_ROOT>/Staging.
+#  1. Finds <USB>/TwinCAT_Update.tar.gz and extracts it to <LOCAL_BACKUP_ROOT>/Staging.
 #  2. Checks the TwinCAT XAR and TF2000 HMI Server versions recorded in the package
 #     (versions.txt) exactly match this machine, and verifies every file in the
 #     package against its SHA-256 hash.
@@ -20,7 +20,7 @@
 #              4 = another update is already running.
 #
 #  Result is also written to <LOCAL_BACKUP_ROOT>/last_update_status.txt and a copy of
-#  the log is written to the USB stick (TwinCAT_Update/Logs).
+#  the log is written to the USB stick (TwinCAT_Update_Logs, next to the archive).
 #
 #  Options:
 #    --package-path <path>     The package .tar.gz, or the folder holding it. Default: search the USB drives.
@@ -54,10 +54,17 @@ while (( $# )); do
     shift
 done
 
-# True if the folder holds a package: <name>.tar.gz, or (older, uncompressed format) manifest.txt.
-is_package_folder() { [[ -f $1/$PACKAGE_FOLDER_NAME.tar.gz || -f $1/manifest.txt ]]; }
+# Prints the package found in a folder: <name>.tar.gz in it, or the folder itself if it is an
+# uncompressed package (manifest.txt). Older versions of this tool used a <name> folder holding
+# <name>.tar.gz, or an uncompressed <name> folder: both are still found. Returns 1 if there is none.
+package_in_folder() {
+    if [[ -f $1/$PACKAGE_FOLDER_NAME.tar.gz ]]; then echo "$1/$PACKAGE_FOLDER_NAME.tar.gz"
+    elif [[ -f $1/manifest.txt ]]; then echo "$1"
+    else return 1
+    fi
+}
 
-# Sets USB_DIR to the single package folder found on the USB drives.
+# Sets PKG_SOURCE to the single package found on the USB drives.
 find_update_package() {
     mount_usb_drives
     local roots=() r p found=()
@@ -65,22 +72,25 @@ find_update_package() {
     mapfile -t roots < <(usb_mount_points)
     roots+=(/media/* /media/*/* /run/media/*/* /mnt /mnt/*)
     for r in "${roots[@]}"; do
-        p="$r/$PACKAGE_FOLDER_NAME"
-        is_package_folder "$p" || continue
-        p=$(readlink -f -- "$p")
-        [[ -n ${seen[$p]} ]] && continue
-        seen[$p]=1
-        found+=("$p")
+        [[ -d $r ]] || continue
+        # current: <USB>/<name>.tar.gz, then the older <USB>/<name>/ layouts
+        for p in "$(package_in_folder "$r")" "$(package_in_folder "$r/$PACKAGE_FOLDER_NAME")"; do
+            [[ -n $p ]] || continue
+            p=$(readlink -f -- "$p")
+            [[ -n ${seen[$p]} ]] && continue
+            seen[$p]=1
+            found+=("$p")
+        done
     done
     if (( ${#found[@]} == 0 )); then
-        log_error "No update package found (looked for <USB>/$PACKAGE_FOLDER_NAME/$PACKAGE_FOLDER_NAME.tar.gz on the USB drives, /media, /run/media and /mnt)."
+        log_error "No update package found (looked for <USB>/$PACKAGE_FOLDER_NAME.tar.gz on the USB drives, /media, /run/media and /mnt)."
         return 1
     fi
     if (( ${#found[@]} > 1 )); then
         log_error "Several update packages found: $(join_array ', ' found). Remove all but one, or pass --package-path."
         return 1
     fi
-    USB_DIR=${found[0]}
+    PKG_SOURCE=${found[0]}
 }
 
 write_status() {   # status detail
@@ -177,7 +187,7 @@ CONFIG_LOADED=0
 RESTART_SERVICES=()
 PKG=''          # uncompressed package (manifest.txt, Boot, HMI) that is verified and installed
 PKG_SOURCE=''   # the archive (or old-format folder) the update comes from
-USB_DIR=''      # package folder on the stick (logs are copied back there)
+USB_DIR=''      # folder on the stick the machine log is copied back to
 STAGING_DIR=''
 
 fail() {
@@ -214,9 +224,9 @@ finish() {
         log "Result: $STATUS_TEXT (exit code $EXIT_CODE)"
 
         # Copy the log onto the USB stick so the result can be checked on the bench.
-        if [[ -n $USB_DIR && -n $LOG_FILE && -d $USB_DIR ]]; then
-            usb_log="$USB_DIR/Logs/$(uname -n)_${STAMP}_${STATUS_TEXT//+([^A-Za-z])/_}.log"
-            { mkdir -p -- "$USB_DIR/Logs" && cp -f -- "$LOG_FILE" "$usb_log" && sync; } 2>/dev/null ||
+        if [[ -n $USB_DIR && -n $LOG_FILE && -d $(dirname -- "$USB_DIR") ]]; then
+            usb_log="$USB_DIR/$(uname -n)_${STAMP}_${STATUS_TEXT//+([^A-Za-z])/_}.log"
+            { mkdir -p -- "$USB_DIR" && cp -f -- "$LOG_FILE" "$usb_log" && sync; } 2>/dev/null ||
                 log_warn "Could not copy log to USB: $usb_log"
         fi
         unmount_usb_drives
@@ -250,11 +260,16 @@ write_status RUNNING 'Update in progress'
 # =========================================================================
 if [[ -n $PACKAGE_PATH && -f $PACKAGE_PATH ]]; then
     PKG_SOURCE=$(readlink -f -- "$PACKAGE_PATH")
-    USB_DIR=$(dirname -- "$PKG_SOURCE")
+elif [[ -n $PACKAGE_PATH ]]; then
+    PKG_SOURCE=$(package_in_folder "$(readlink -f -- "$PACKAGE_PATH")") ||
+        fail "No update package in '$PACKAGE_PATH' (expected $PACKAGE_FOLDER_NAME.tar.gz or manifest.txt)."
 else
-    if [[ -n $PACKAGE_PATH ]]; then USB_DIR=$(readlink -f -- "$PACKAGE_PATH"); else find_update_package || fail; fi
-    PKG_SOURCE="$USB_DIR/$PACKAGE_FOLDER_NAME.tar.gz"
-    [[ -f $PKG_SOURCE ]] || PKG_SOURCE=$USB_DIR   # older, uncompressed package
+    find_update_package || fail
+fi
+if [[ -f $PKG_SOURCE ]]; then
+    USB_DIR="$(dirname -- "$PKG_SOURCE")/${PACKAGE_FOLDER_NAME}_Logs"
+else
+    USB_DIR="$PKG_SOURCE/Logs"   # older, uncompressed package
 fi
 log "Package: $PKG_SOURCE"
 

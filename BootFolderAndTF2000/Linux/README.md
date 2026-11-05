@@ -4,7 +4,7 @@ Linux version of the [Windows scripts](../Windows/README.md). It works the same 
 
 | Where | Run | What it does |
 |---|---|---|
-| **Bench system** | `Create-UpdatePackage.sh` | Uses ADS to switch TwinCAT to Config mode and stops the HMI Server (`TcHmiSrv`). Copies the Boot folder and HMI Server folder to a local build folder with SHA-256 checksums, restarts both, then compresses the package to `<USB>/TwinCAT_Update/TwinCAT_Update.tar.gz`. |
+| **Bench system** | `Create-UpdatePackage.sh` | Uses ADS to switch TwinCAT to Config mode and stops the HMI Server (`TcHmiSrv`). Copies the Boot folder and HMI Server folder to a local build folder with SHA-256 checksums, restarts both, then compresses the package to a single file, `<USB>/TwinCAT_Update.tar.gz`. |
 | **Machine IPC** | `Apply-Update.sh` (started by the PLC) | Finds the archive on the USB stick, extracts it to a local staging folder and verifies it. Uses ADS to switch to Config mode and stops the HMI Server. Backs up the old version, replaces the folders, verifies them, rolls back if anything fails, then reboots. |
 
 ```
@@ -39,7 +39,7 @@ scripts/Install-UpdatePackage.sh            machine logic
    dpkg -l | grep -i -e tc31 -e tf2000
    ```
 4. **Check the HMI service name** (`HMI_SERVICE_NAME`, default `TcHmiSrv`): `systemctl status TcHmiSrv`.
-5. **On each machine**, copy this whole folder to a fixed local path, for example `/opt/TwinCAT_UpdateTool/`. The USB stick only needs to hold the `TwinCAT_Update` package folder.
+5. **On each machine**, copy this whole folder to a fixed local path, for example `/opt/TwinCAT_UpdateTool/`. The USB stick only needs to hold `TwinCAT_Update.tar.gz`.
 
 Headless IPCs usually don't mount USB sticks automatically. With `AUTO_MOUNT_USB=1` (the default), the scripts mount any unmounted USB partition under `/run/twincat-update/`, and flush and unmount it again at the end. A stick that was already mounted is left mounted.
 
@@ -88,7 +88,7 @@ Set `NOPAUSE=1` to stop `Create-UpdatePackage.sh` waiting for Enter at the end.
 ## Result and logs (machine)
 
 - `/var/lib/TwinCAT_UpdateBackups/last_update_status.txt`: `SUCCESS` / `FAILED - nothing changed` / `FAILED - previous version restored` / `FAILED - ROLLBACK FAILED`
-- `/var/lib/TwinCAT_UpdateBackups/Logs/Apply_<time>.log`. A copy also goes to `<USB>/TwinCAT_Update/Logs/`.
+- `/var/lib/TwinCAT_UpdateBackups/Logs/Apply_<time>.log`. A copy also goes to `<USB>/TwinCAT_Update_Logs/`.
 - `/var/lib/TwinCAT_UpdateBackups/<time>_before_update/`: the old Boot and HMI folders. The last 5 are kept (`BACKUPS_TO_KEEP`).
 
 Exit codes: 0 ok, 1 failed (nothing changed), 2 failed and rolled back, 3 rollback failed (the IPC is left in Config mode and **not** rebooted), 4 already running.
@@ -100,11 +100,11 @@ The reboot is scheduled as a systemd timer, so it happens even if the script is 
 ## Package format
 
 ```
-TwinCAT_Update/
-  TwinCAT_Update.tar.gz            the package (contents below)
+<USB>/
+  TwinCAT_Update.tar.gz            the package: one file (contents below)
   TwinCAT_Update_previous.tar.gz   the package before that
-  create.log                       bench log (create_previous.log for the one before)
-  Logs/                            logs copied back from the machines
+  TwinCAT_Update_create.log        bench log (TwinCAT_Update_create_previous.log for the one before)
+  TwinCAT_Update_Logs/             logs copied back from the machines (created by the first update)
 
 Inside TwinCAT_Update.tar.gz:
   Boot/  HMI/          the copied folders
@@ -125,4 +125,4 @@ Packages are not interchangeable between the Windows and Linux versions (differe
 - **File ownership.** USB sticks (FAT/exFAT) can't store Linux owners or permissions, so installed files get the owner and group of the target folder (e.g. the owner of `/etc/TwinCAT/3.1/Boot`). Existing files keep their permissions. Symlinks in the source folders are not packaged. The local backups are exact copies (owners, permissions, symlinks), so a rollback restores everything exactly.
 - **Version check (exact match).** The bench records the installed version of the XAR and TF2000 packages (e.g. `3.1.4026.12`, the Debian revision is dropped) in `versions.txt`. Apply-Update reads the same values on the machine. If either differs, or can't be read, it stops with an error **before anything is stopped or changed**. The bench refuses to build a package if it can't read either version.
 - **Hardware binding.** The Boot folder holds the bench's I/O configuration. EtherCAT adapters are bound to a MAC address or PCI slot, so the bench and machines should be the same IPC model and use the same adapter binding. Licences are not part of the Boot folder and don't move with it.
-- Incomplete archives are written as `TwinCAT_Update.tar.gz.partial` and are never picked up. The previous package on the stick is kept as `TwinCAT_Update_previous.tar.gz`. An uncompressed `TwinCAT_Update` folder from an older version of the scripts is moved to `TwinCAT_Update_previous` the first time the new version builds a package. The stick is flushed (`sync`) before the bench reports success.
+- Incomplete archives are written as `TwinCAT_Update.tar.gz.partial` and are never picked up. The previous package on the stick is kept as `TwinCAT_Update_previous.tar.gz`. A `TwinCAT_Update` folder from an older version of the scripts is renamed to `TwinCAT_Update_old` the first time the new version builds a package (it can be deleted). Apply-Update still accepts packages in the older layouts. The stick is flushed (`sync`) before the bench reports success.

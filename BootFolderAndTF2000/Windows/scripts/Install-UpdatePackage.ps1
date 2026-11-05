@@ -5,7 +5,7 @@
 
 .DESCRIPTION
     Nothing on the machine is touched until the package has been fully validated.
-    1. Finds <drive>:\TwinCAT_Update\TwinCAT_Update.zip on the attached drives and unzips
+    1. Finds <drive>:\TwinCAT_Update.zip on the attached drives and unzips
        it to <LocalBackupRoot>\Staging (deleted again at the end).
     2. Checks the TwinCAT XAR and TF2000 HMI Server versions recorded in the package
        (versions.json) exactly match this machine, and verifies every file in the
@@ -21,11 +21,11 @@
                 4 = another update is already running.
 
     Result is also written to <LocalBackupRoot>\last_update_status.txt and a copy of the
-    log is written to the USB stick (TwinCAT_Update\Logs).
+    log is written to the USB stick (TwinCAT_Update_Logs, next to the zip).
 
 .PARAMETER PackagePath
     Full path of the package zip, or of the folder that contains it.
-    Default: search all drives for \TwinCAT_Update\TwinCAT_Update.zip.
+    Default: search all drives for \TwinCAT_Update.zip (and the older \TwinCAT_Update\ folder).
     An unzipped package folder from an older version of this tool also works.
 
 .PARAMETER NoReboot
@@ -47,21 +47,28 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'Common.ps1')
 if (-not $ConfigPath) { $ConfigPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'Config.ps1' }
 
-# True if Folder holds a package: <FolderName>.zip, or (older, unzipped format) manifest.json.
-function Test-PackageFolder {
-    param([string]$Folder, [string]$FolderName)
-    (Test-Path -LiteralPath (Join-Path $Folder "$FolderName.zip") -PathType Leaf) -or
-        (Test-Path -LiteralPath (Join-Path $Folder 'manifest.json') -PathType Leaf)
+# Returns the package found in Folder: <Name>.zip in it, or Folder itself if it is an unzipped
+# package (manifest.json). Older versions of this tool used a <Name> folder holding <Name>.zip,
+# or an unzipped <Name> folder: both are still found. Returns $null if there is none.
+function Get-PackageInFolder {
+    param([string]$Folder, [string]$Name)
+    $zip = Join-Path $Folder "$Name.zip"
+    if (Test-Path -LiteralPath $zip -PathType Leaf) { return $zip }
+    if (Test-Path -LiteralPath (Join-Path $Folder 'manifest.json') -PathType Leaf) { return $Folder }
+    $null
 }
 
 function Find-UpdatePackage {
-    param([string]$FolderName)
+    param([string]$Name)
     $found = @(foreach ($d in [IO.DriveInfo]::GetDrives()) {
         if (-not $d.IsReady -or $d.DriveType -notin 'Removable', 'Fixed') { continue }
-        $p = Join-Path $d.RootDirectory.FullName $FolderName
-        if (Test-PackageFolder $p $FolderName) { $p }
+        $root = $d.RootDirectory.FullName
+        Get-PackageInFolder $root $Name                                # current: <drive>:\<Name>.zip
+        $old = Join-Path $root $Name
+        if (Test-Path -LiteralPath $old -PathType Container) { Get-PackageInFolder $old $Name }   # older layouts
     })
-    if ($found.Count -eq 0) { throw "No update package found (looked for <drive>:\$FolderName\$FolderName.zip on all drives)." }
+    $found = @($found | Where-Object { $_ })
+    if ($found.Count -eq 0) { throw "No update package found (looked for <drive>:\$Name.zip on all drives)." }
     if ($found.Count -gt 1) { throw "Several update packages found: $($found -join ', '). Remove all but one, or pass -PackagePath." }
     $found[0]
 }
@@ -121,17 +128,21 @@ try {
     # =========================================================================
     #  PHASE 1 - validate. Nothing on the machine is changed in this phase.
     # =========================================================================
-    # $usbDir: package folder on the stick (logs are copied back there).
-    # $pkgSource: the zip (or old-format folder) the update comes from.
+    # $pkgSource: the zip (or old-format unzipped folder) the update comes from.
+    # $usbDir: folder on the stick the machine log is copied back to.
     # $pkg: unzipped package (manifest.json, Boot, HMI) that is verified and installed.
-    $zipName = "$($S.PackageFolderName).zip"
     if ($PackagePath -and (Test-Path -LiteralPath $PackagePath -PathType Leaf)) {
         $pkgSource = Get-NormalizedPath $PackagePath
-        $usbDir = Split-Path -Parent $pkgSource
+    } elseif ($PackagePath) {
+        $pkgSource = Get-PackageInFolder (Get-NormalizedPath $PackagePath) $S.PackageFolderName
+        if (-not $pkgSource) { throw "No update package in '$PackagePath' (expected $($S.PackageFolderName).zip or manifest.json)." }
     } else {
-        $usbDir = if ($PackagePath) { Get-NormalizedPath $PackagePath } else { Find-UpdatePackage $S.PackageFolderName }
-        $pkgSource = Join-Path $usbDir $zipName
-        if (-not (Test-Path -LiteralPath $pkgSource -PathType Leaf)) { $pkgSource = $usbDir }   # older, unzipped package
+        $pkgSource = Find-UpdatePackage $S.PackageFolderName
+    }
+    if (Test-Path -LiteralPath $pkgSource -PathType Leaf) {
+        $usbDir = Join-Path (Split-Path -Parent $pkgSource) "$($S.PackageFolderName)_Logs"
+    } else {
+        $usbDir = Join-Path $pkgSource 'Logs'
     }
     Write-Log "Package: $pkgSource"
 
@@ -299,9 +310,9 @@ finally {
         }
 
         # Copy the log onto the USB stick so the result can be checked on the bench.
-        if ($usbDir -and $script:LogFile -and (Test-Path -LiteralPath $usbDir)) {
+        if ($usbDir -and $script:LogFile -and (Test-Path -LiteralPath (Split-Path -Parent $usbDir))) {
             try {
-                $usbLogs = Join-Path $usbDir 'Logs'
+                $usbLogs = $usbDir
                 New-Item -ItemType Directory -Path $usbLogs -Force | Out-Null
                 Copy-Item -LiteralPath $script:LogFile -Destination (Join-Path $usbLogs "$($env:COMPUTERNAME)_$stamp`_$($statusText -replace '[^A-Za-z]+', '_').log") -Force
             } catch { Write-Log -Level WARN "Could not copy log to USB: $($_.Exception.Message)" }

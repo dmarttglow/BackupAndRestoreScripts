@@ -4,7 +4,7 @@
 #  This file is sourced bash: keep the variable names, edit the values.
 # =============================================================================
 
-# Name of the package folder at the root of the USB stick.
+# Name of the package on the USB stick: <name>.tar.gz at the root of the stick.
 PACKAGE_FOLDER_NAME='TwinCAT_Update'
 
 # Local folder on the machine IPC where the OLD Boot/HMI folders are saved

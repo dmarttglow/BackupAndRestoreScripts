@@ -10,12 +10,12 @@ Scripts for backing up, moving and restoring software on Beckhoff TwinCAT 3 IPCs
 
 You build the software on a **bench system**, then put it on each **machine IPC** with a USB stick. No engineering laptop or TwinCAT XAE is needed at the machine.
 
-1. **On the bench:** plug in a USB stick and run `Create-UpdatePackage.bat`. It briefly stops TwinCAT and the HMI Server and copies the Boot and HMI folders. It also saves a checksum for every file and records the TwinCAT / TF2000 versions, then starts TwinCAT and the HMI Server again and zips everything to `<USB>:\TwinCAT_Update\TwinCAT_Update.zip`.
+1. **On the bench:** plug in a USB stick and run `Create-UpdatePackage.bat`. It briefly stops TwinCAT and the HMI Server and copies the Boot and HMI folders. It also saves a checksum for every file and records the TwinCAT / TF2000 versions, then starts TwinCAT and the HMI Server again and zips everything into a single file, `<USB>:\TwinCAT_Update.zip`.
 2. **At the machine:** plug in the stick and press the update button on the HMI. The PLC runs `Apply-Update.bat`, which:
    - unzips the package to a local folder, checks it is complete and that the TwinCAT / TF2000 versions match this machine (if anything is wrong, it stops and changes nothing)
    - stops TwinCAT and the HMI Server, backs up the current version, and copies in the new one
    - checks every file, restores the backup automatically if anything fails, then reboots
-3. **Check the result** in `C:\TwinCAT_UpdateBackups\last_update_status.txt` on the machine, or in the log copied back to the stick under `TwinCAT_Update\Logs\`.
+3. **Check the result** in `C:\TwinCAT_UpdateBackups\last_update_status.txt` on the machine, or in the log copied back to the stick under `TwinCAT_Update_Logs\`.
 
 Before the first use, check the paths in `BootFolderAndTF2000\Windows\Config.ps1`. Then copy the folder to a fixed local path on each machine (e.g. `C:\TwinCAT_UpdateTool\`). [BootFolderAndTF2000/Windows/README.md](BootFolderAndTF2000/Windows/README.md) covers the full setup, the PLC trigger code, optional arguments, logs and manual rollback.
 

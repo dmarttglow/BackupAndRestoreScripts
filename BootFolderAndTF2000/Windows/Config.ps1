@@ -5,7 +5,7 @@
 # =============================================================================
 
 $Settings = @{
-    # Name of the package folder at the root of the USB stick.
+    # Name of the package on the USB stick: <name>.zip at the root of the stick.
     PackageFolderName        = 'TwinCAT_Update'
 
     # Local folder on the machine IPC where the OLD Boot/HMI folders are saved
