@@ -24,8 +24,14 @@ if errorlevel 1 (
     exit /b
 )
 
-:: Optional status screen (UpdateScreen\Install-UpdateScreen.bat). If the task is
-:: not installed this does nothing, and the update never waits for or needs it.
+:: Status screen (UpdateScreen\). The first time this runs on a machine, its scheduled
+:: task is installed automatically (only if the tool is on a local disk, e.g.
+:: C:\TwinCAT_UpdateTool). If anything about the screen fails, the update runs anyway:
+:: it never waits for or needs the screen.
+schtasks.exe /Query /TN "TwinCAT Update Screen" >nul 2>&1
+if errorlevel 1 if exist "%~dp0UpdateScreen\Install-UpdateScreen.ps1" (
+    powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0UpdateScreen\Install-UpdateScreen.ps1" -IfMissing >nul 2>&1
+)
 schtasks.exe /Run /TN "TwinCAT Update Screen" >nul 2>&1
 
 powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0scripts\Install-UpdatePackage.ps1" %*

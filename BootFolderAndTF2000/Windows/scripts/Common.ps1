@@ -102,7 +102,10 @@ function Set-ProgressResult {
     Save-ProgressFile -Force
 }
 
-# Writes the state as JSON at most once per second (always with -Force).
+# Writes the state at most once per second (always with -Force), twice:
+#   update_progress.json  read by the PowerShell status window
+#   update_progress.js    "updateProgress({...});" - loaded as a <script> by the status page in
+#                         the TF1200 UI Client (a file:// page in Chromium cannot read JSON files)
 function Save-ProgressFile {
     param([switch]$Force)
     if (-not $script:ProgressFile -or -not $script:ProgressState) { return }
@@ -111,11 +114,19 @@ function Save-ProgressFile {
     $script:ProgressLastWrite = $now
     try {
         $script:ProgressState.UpdatedUtc = $now.ToString('o')
-        $tmp = "$($script:ProgressFile).tmp"
-        [IO.File]::WriteAllText($tmp, ($script:ProgressState | ConvertTo-Json -Compress), (New-Object Text.UTF8Encoding $false))
-        if ([IO.File]::Exists($script:ProgressFile)) { [IO.File]::Delete($script:ProgressFile) }
-        [IO.File]::Move($tmp, $script:ProgressFile)
+        $json = $script:ProgressState | ConvertTo-Json -Compress
+        Write-FileAtomic $script:ProgressFile $json
+        Write-FileAtomic ([IO.Path]::ChangeExtension($script:ProgressFile, '.js')) "updateProgress($json);"
     } catch { }
+}
+
+# Writes via a .tmp file so a reader never sees a half-written file.
+function Write-FileAtomic {
+    param([string]$Path, [string]$Text)
+    $tmp = "$Path.tmp"
+    [IO.File]::WriteAllText($tmp, $Text, (New-Object Text.UTF8Encoding $false))
+    if ([IO.File]::Exists($Path)) { [IO.File]::Delete($Path) }
+    [IO.File]::Move($tmp, $Path)
 }
 
 function Clear-ProgressLine {

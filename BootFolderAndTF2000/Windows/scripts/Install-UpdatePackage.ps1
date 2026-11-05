@@ -94,6 +94,43 @@ function Remove-OldBackups {
     }
 }
 
+# Full restart of the controller (shutdown /r: never a Fast Startup / hybrid boot; /f: apps are
+# closed without asking). Returns $true once a restart is scheduled or started, $false if
+# Windows refused, so the caller can bring TwinCAT and the HMI back up instead.
+function Restart-Controller {
+    param([int]$DelaySec, [string]$Reason, [string]$ProgressState, [string]$ErrorText)
+    $DelaySec = [Math]::Max(1, $DelaySec)
+    Write-Log -Level STEP "Restarting the controller in $DelaySec s..."
+    # shutdown.exe is run through cmd /c: it writes its messages to stderr, which Windows
+    # PowerShell turns into a terminating error under $ErrorActionPreference = 'Stop'.
+    try {
+        [void](& cmd.exe /c 'shutdown.exe /a >nul 2>&1')   # replace a restart that is already pending (e.g. Windows Update)
+        $out = & cmd.exe /c "shutdown.exe /r /f /t $DelaySec /d p:4:1 /c `"$Reason`" 2>&1"
+        $rc = $LASTEXITCODE
+    } catch { $out = $_.Exception.Message; $rc = -1 }
+
+    if ($rc -eq 0) {
+        Set-ProgressResult -State $ProgressState -ErrorText $ErrorText -RebootInSec $DelaySec
+        Write-Log -Level OK 'Restart scheduled.'
+        for ($sec = $DelaySec; $sec -gt 0; $sec--) {
+            Write-ProgressLine -Force "$Reason - controller restarts in $sec s  (cancel: shutdown /a)"
+            Start-Sleep -Seconds 1
+        }
+        Clear-ProgressLine
+        return $true
+    }
+    Write-Log -Level WARN "shutdown.exe could not schedule the restart (exit code $rc): $out"
+    try {
+        Restart-Computer -Force -ErrorAction Stop
+        Set-ProgressResult -State $ProgressState -ErrorText $ErrorText -RebootInSec 0
+        Write-Log -Level OK 'Restart started (Restart-Computer -Force).'
+        return $true
+    } catch {
+        Write-Log -Level ERROR "RESTART FAILED: $($_.Exception.Message). Starting TwinCAT and the HMI Server again instead - restart the controller by hand."
+        return $false
+    }
+}
+
 $exitCode = 1
 $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $machineTouched = $false     # true once the target folders may have been modified
@@ -319,20 +356,15 @@ finally {
         }
 
         $progressState = switch ($exitCode) { 0 { 'Success' } 2 { 'RolledBack' } 3 { 'RollbackFailed' } default { 'Failed' } }
-        $rebooting = $stopped -and $exitCode -ne 3 -and $S.RebootAfterApply -and -not $NoReboot
+        $rebooting = $false
         if ($stopped) {
             if ($exitCode -eq 3) {
                 Write-Log -Level ERROR 'Machine left stopped (Config mode) because the rollback failed. NOT rebooting.'
             } elseif ($S.RebootAfterApply -and -not $NoReboot) {
-                Write-Log -Level STEP "Rebooting in $($S.RebootDelaySeconds) s..."
-                Set-ProgressResult -State $progressState -ErrorText $errorText -RebootInSec $S.RebootDelaySeconds
-                & shutdown.exe /r /f /t $S.RebootDelaySeconds /d p:4:1 /c "TwinCAT update: $statusText"
-                for ($s = [int]$S.RebootDelaySeconds; $s -gt 0; $s--) {
-                    Write-ProgressLine -Force "$statusText - controller restarts in $s s  (cancel: shutdown /a)"
-                    Start-Sleep -Seconds 1
-                }
-                Clear-ProgressLine
-            } else {
+                $rebooting = Restart-Controller -DelaySec $S.RebootDelaySeconds -Reason "TwinCAT update: $statusText" -ProgressState $progressState -ErrorText $errorText
+            }
+            if (-not $rebooting -and $exitCode -ne 3) {
+                # No restart (not wanted, or it failed): bring the HMI Server and TwinCAT back up here.
                 Set-ProgressStep restart 'Starting TwinCAT and the HMI Server' 97 99
                 foreach ($svc in $servicesToStart) { [void](Start-ServiceSafe -Name $svc -TimeoutSec $S.ServiceStopTimeoutSec) }
                 try { Set-TwinCATMode -Mode Run -TimeoutSec $S.AdsStateTimeoutSec }

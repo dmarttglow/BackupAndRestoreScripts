@@ -46,29 +46,34 @@ TwinCAT keeps running until the package has been fully validated. If the stick i
 
 ## Update status screen (optional)
 
-On a machine with an HMI panel, `UpdateScreen\` puts up a full-screen kiosk page while Apply-Update runs. The page says the system is being updated, warns not to switch off the power or remove the USB stick, and shows live progress: a progress bar, the current step, file counts and elapsed time. At the end it shows the result: *Update complete* (with the reboot countdown), *Update not applied* (nothing changed), *previous version restored*, or *service needed* if the rollback failed.
+On a machine with an HMI panel, `UpdateScreen\` switches the **TF1200 UI Client** from the HMI to a status page while Apply-Update runs. The page says the system is being updated, warns not to switch off the power or remove the USB stick, and shows live progress: a progress bar, the current step, file counts and elapsed time. At the end it shows the result: *Update complete* (with the restart countdown), *Update not applied* (nothing changed), *previous version restored*, or *service needed* if the rollback failed.
 
 ```
 UpdateScreen\Install-UpdateScreen.bat   run once per machine (admin): registers the scheduled task
-UpdateScreen\Show-UpdateScreen.ps1      WPF kiosk window (borderless, topmost) hosting the page
+UpdateScreen\Show-UpdateScreen.ps1      switches the TF1200 UI Client to the page (or opens a fallback window)
 UpdateScreen\UpdateScreen.html          the page itself: edit text/colours/logo here
 ```
 
-**Setup:** after copying the tool to `C:\TwinCAT_UpdateTool\`, run `UpdateScreen\Install-UpdateScreen.bat` once. To remove it: `Install-UpdateScreen.bat -Uninstall`.
+**Setup:** after copying the tool to `C:\TwinCAT_UpdateTool\`, run `UpdateScreen\Install-UpdateScreen.bat` once. To remove it: `Install-UpdateScreen.bat -Uninstall`. Nothing in the UI Client's own configuration has to be changed.
 
-**Preview** without running an update (windowed, simulated progress). `-DemoResult` can be `Success`, `Failed`, `RolledBack` or `RollbackFailed`:
+**Preview** without running an update, with the UI Client open (simulated progress; it switches to the page and ends back on the HMI after about 2.5 minutes). `-DemoResult` can be `Success`, `Failed`, `RolledBack` or `RollbackFailed`:
 ```
-powershell -STA -ExecutionPolicy Bypass -File UpdateScreen\Show-UpdateScreen.ps1 -Demo -Windowed -DemoResult Success
+powershell -STA -ExecutionPolicy Bypass -File UpdateScreen\Show-UpdateScreen.ps1 -Demo -DemoResult Success
 ```
 
 **How it works**
 
-- **The update never depends on the screen.** `Install-UpdatePackage.ps1` only writes its progress to `C:\TwinCAT_UpdateBackups\update_progress.json`, and any error writing that file is ignored. The screen only reads that file. If the screen is not installed, crashes or is closed, the update runs exactly the same.
-- **Why a scheduled task:** the PLC starts Apply-Update as SYSTEM in session 0, where windows are invisible. So `Apply-Update.bat` doesn't open the screen itself. It runs `schtasks /Run /TN "TwinCAT Update Screen"` and ignores the result. The task runs as the local *Users* group, so it opens on the desktop of whoever is logged on (e.g. the HMI auto-logon user). With no one logged on, no screen appears and the update still runs.
-- **Kiosk behaviour:** the window covers the HMI browser and can't be closed with Alt+F4 while the update runs. For maintenance, **Ctrl+Shift+F12** always closes it. A result without a reboot shows a *Close* button and closes by itself (20 s after success, 120 s after a failure). *Service needed* stays until someone closes it. During the reboot countdown there is no Close button.
-- If no update starts within 90 s (e.g. the stick was missing and Apply-Update stopped before writing progress), the screen closes by itself. Errors from the screen are logged to `%TEMP%\TwinCAT_UpdateScreen.log` of the logged-on user.
-- **Rendering:** the page is shown by the WPF `WebBrowser` control (the Internet Explorer 11 engine built into Windows), so nothing has to be installed. Keep any edits to `UpdateScreen.html` IE11-compatible (no CSS variables, no `let`/`const`/arrow functions).
-- The logged-on user needs read access to `C:\TwinCAT_UpdateBackups` (the default permissions under `C:\` allow this).
+- **Switching the UI Client.** The UI Client has no way to change its page from outside while it runs: it loads `startUrl` from its configuration file once at startup. So when an update starts, `Show-UpdateScreen.ps1` reads the configuration the running UI Client uses (its `--config-path`, or `%AppData%\Beckhoff\TF1200-UI-Client\config.json`). It writes a copy with only `startUrl` changed to `%TEMP%\TwinCAT_UpdateScreen\`, and restarts the UI Client with `--config-path` pointing at that copy. Kiosk mode, keys and all other settings stay the same. **The real configuration file is never changed**, so after the restart at the end of the update the UI Client opens the HMI as usual. If the UI Client does not come up on the page within 20 s, it is started again the way it was.
+- **When the update ends without a restart** (*Update not applied*, or a run with `-NoReboot`), the page goes back to the UI Client's normal start page by itself: 20 s after success, 120 s after a failure, or straight away with the *Close* button. *Service needed* stays until someone presses *Close*. During the restart countdown there is no Close button.
+- **The HMI stays up if nothing happens.** The UI Client is only switched once Apply-Update has really started (within 90 s of the button press). If the stick is missing, the page shows *Update not applied* with the reason.
+- **Fallback:** if no UI Client is running in the logged-on session, a full-screen PowerShell (WPF) window shows the same page instead. It can't be closed with Alt+F4 while the update runs. For maintenance, **Ctrl+Shift+F12** always closes it. That window uses the Internet Explorer 11 engine, so keep any edits to `UpdateScreen.html` IE11-compatible (no CSS variables, no `let`/`const`/arrow functions).
+- **The update never depends on the screen.** `Install-UpdatePackage.ps1` only writes its progress to `C:\TwinCAT_UpdateBackups\update_progress.json` and `update_progress.js` (the page in the UI Client loads the `.js` copy, because a local page in Chromium can't read JSON files). Any error writing them is ignored. If the screen is not installed or fails, the update runs exactly the same.
+- **Why a scheduled task:** the PLC starts Apply-Update as SYSTEM in session 0, where windows are invisible and the UI Client of the logged-on user can't be reached. So `Apply-Update.bat` runs `schtasks /Run /TN "TwinCAT Update Screen"` and ignores the result. The task runs as the local *Users* group, so it runs in the session of whoever is logged on (e.g. the HMI auto-logon user). With no one logged on, nothing is switched and the update still runs.
+- Errors from the PowerShell window are logged to `%TEMP%\TwinCAT_UpdateScreen.log` of the logged-on user. The logged-on user needs read access to `C:\TwinCAT_UpdateBackups` (the default permissions under `C:\` allow this).
+
+## Restart after the update
+
+After a successful update (and after a rollback) the IPC does a full restart (`shutdown /r /f`, never a Fast Startup / hybrid boot), `RebootDelaySeconds` (10 s) after the result is shown, so TwinCAT and the HMI start cleanly on the new Boot folder. Running programs are closed without asking. If Windows refuses to schedule the restart, Apply-Update logs the reason and restarts with `Restart-Computer -Force` instead. A rollback that failed never restarts: the IPC stays in Config mode for service. `RebootAfterApply = $false` in `Config.ps1`, or `-NoReboot`, turns the restart off.
 
 ## Optional arguments
 

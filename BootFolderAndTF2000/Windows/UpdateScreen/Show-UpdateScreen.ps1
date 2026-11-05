@@ -4,9 +4,18 @@
     screen with live progress, shown while Apply-Update runs.
 
 .DESCRIPTION
-    A WPF kiosk window (borderless, maximised, topmost) that renders UpdateScreen.html
-    in a WebBrowser control and feeds it the progress Apply-Update writes to
-    <LocalBackupRoot>\update_progress.json.
+    Shows UpdateScreen.html, which displays the progress Apply-Update writes to
+    <LocalBackupRoot>\update_progress.json / .js. Two ways:
+
+    TF1200 UI Client (used when the UI Client is running in this session): as soon as
+    an update starts, the UI Client is restarted on the status page, using a copy of
+    its own configuration in which only startUrl is changed (the real config file is
+    never modified). The page then updates itself. When the update ends without a
+    reboot, the page goes back to the UI Client's normal start page (the HMI). After a
+    reboot the UI Client starts with its normal configuration anyway.
+
+    PowerShell window (fallback when no UI Client is running): a WPF kiosk window
+    (borderless, maximised, topmost) that renders the page in a WebBrowser control.
 
     The update never depends on this screen: Apply-Update only writes the progress
     file. This script only reads it, and closing or crashing it changes nothing.
@@ -24,8 +33,12 @@
         (Close button, closes by itself), rollback failed (stays until closed)
       - stays up through the reboot countdown
 
+.PARAMETER Mode
+    Auto (default): the TF1200 UI Client if it is running in this session, otherwise the
+    PowerShell window. HmiClient / Window: force one of them.
+
 .PARAMETER Windowed
-    Normal resizable window instead of full-screen kiosk (for testing).
+    PowerShell window only: normal resizable window instead of full-screen kiosk (for testing).
 
 .PARAMETER Demo
     Show simulated progress instead of reading the progress file (preview the screen).
@@ -38,6 +51,7 @@
 param(
     [string]$ProgressFile,
     [string]$ConfigPath,
+    [ValidateSet('Auto', 'HmiClient', 'Window')][string]$Mode = 'Auto',
     [int]$WaitForStartSec = 90,
     [switch]$Windowed,
     [switch]$Demo,
@@ -189,7 +203,127 @@ try {
         $vm
     }
 
-    # --- Window ------------------------------------------------------------------
+    # =============================================================================
+    #  TF1200 UI Client
+    # =============================================================================
+    $clientWork = Join-Path $env:TEMP 'TwinCAT_UpdateScreen'
+    $clientConfig = Join-Path $clientWork 'TF1200-config.json'   # copy with startUrl = status page
+    $clientOriginal = Join-Path $clientWork 'original.json'      # how the UI Client was running before
+
+    function Get-ClientProcesses {
+        $sid = (Get-Process -Id $PID).SessionId
+        @(Get-CimInstance Win32_Process -Filter "Name='TF1200-UI-Client.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.SessionId -eq $sid })
+    }
+
+    # The running UI Client in this session: exe, arguments and config file. $null if none.
+    function Get-HmiClient {
+        $main = @(Get-ClientProcesses | Where-Object { [string]$_.CommandLine -notmatch '\s--type=' })   # not the Chromium helper processes
+        if ($main.Count -eq 0) { return $null }
+        $cl = [string]$main[0].CommandLine
+        $arguments = if ($cl -match '^\s*("[^"]*"|\S+)\s*(.*)$') { $Matches[2] } else { '' }
+        $cfg = if ($cl -match '--config-path=(?:"([^"]+)"|(\S+))') { if ($Matches[1]) { $Matches[1] } else { $Matches[2] } }
+               else { Join-Path $env:APPDATA 'Beckhoff\TF1200-UI-Client\config.json' }
+        $exe = $main[0].ExecutablePath
+        if (-not $exe) {
+            $exe = @("${env:ProgramFiles(x86)}\Beckhoff\TwinCAT\Functions\TF1200-UI-Client\TF1200-UI-Client.exe",
+                     "${env:ProgramFiles(x86)}\Beckhoff\TcUiClient\TF1200-UI-Client.exe",
+                     "$env:ProgramFiles\Beckhoff\TwinCAT\Functions\TF1200-UI-Client\TF1200-UI-Client.exe",
+                     "$env:ProgramFiles\Beckhoff\TcUiClient\TF1200-UI-Client.exe") | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
+        }
+        [pscustomobject]@{ Exe = $exe; Arguments = $arguments; ConfigPath = [Environment]::ExpandEnvironmentVariables($cfg) }
+    }
+
+    # startUrl may be a URL or a local path, with environment variables (the UI Client allows both).
+    function ConvertTo-PageUrl([string]$u) {
+        $u = [Environment]::ExpandEnvironmentVariables($u)
+        if ($u -match '^[A-Za-z][A-Za-z0-9+.-]+:' -and $u -notmatch '^file:') { return $u }
+        ([Uri]$u).AbsoluteUri
+    }
+
+    function Stop-HmiClient {
+        $procs = Get-ClientProcesses
+        foreach ($p in $procs) { try { Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop } catch { } }
+        $until = [DateTime]::UtcNow.AddSeconds(10)
+        while ((Get-ClientProcesses).Count -and [DateTime]::UtcNow -lt $until) { Start-Sleep -Milliseconds 200 }
+    }
+
+    function Start-HmiClient($exe, [string]$arguments) {
+        if ($arguments) { Start-Process -FilePath $exe -ArgumentList $arguments -WorkingDirectory (Split-Path -Parent $exe) }
+        else { Start-Process -FilePath $exe -WorkingDirectory (Split-Path -Parent $exe) }
+        $until = [DateTime]::UtcNow.AddSeconds(20)
+        while ([DateTime]::UtcNow -lt $until) {
+            Start-Sleep -Milliseconds 500
+            if (Get-HmiClient) { return $true }
+        }
+        $false
+    }
+
+    function Show-InHmiClient($client) {
+        # Already showing (or was showing) the status page: use the configuration saved back then.
+        if ([IO.Path]::GetFullPath($client.ConfigPath) -eq [IO.Path]::GetFullPath($clientConfig) -and (Test-Path -LiteralPath $clientOriginal)) {
+            $client = Get-Content -LiteralPath $clientOriginal -Raw | ConvertFrom-Json
+        }
+        if (-not $client.Exe) { throw 'TF1200-UI-Client.exe not found.' }
+
+        # Switch only once an update has really started, so the HMI stays up if nothing happens.
+        if (-not $Demo) {
+            while ($true) {
+                $p = Read-ProgressFile
+                $started = $null
+                if ($p) { try { $started = ConvertTo-UtcDate $p.StartedUtc } catch { } }
+                if ($started -and $started -ge $script:uiStart.AddSeconds(-60)) { break }
+                if (([DateTime]::UtcNow - $script:uiStart).TotalSeconds -ge $WaitForStartSec) { return }
+                Start-Sleep -Milliseconds 500
+            }
+        }
+
+        New-Item -ItemType Directory -Path $clientWork -Force | Out-Null
+        $utf8 = New-Object Text.UTF8Encoding $false   # no BOM: the UI Client cannot parse a config with one
+        $page = Join-Path $clientWork 'UpdateScreen.html'
+        Copy-Item -LiteralPath $htmlPath -Destination $page -Force
+        $progressJs = if ($Demo) { Join-Path $clientWork 'demo_progress.js' } else { [IO.Path]::ChangeExtension($ProgressFile, '.js') }
+
+        $cfg = [IO.File]::ReadAllText($client.ConfigPath) | ConvertFrom-Json
+        $screenCfg = [ordered]@{
+            progressScript  = ([Uri]$progressJs).AbsoluteUri
+            returnUrl       = ConvertTo-PageUrl ([string]$cfg.startUrl)
+            notBeforeUtc    = $script:uiStart.AddSeconds(-60).ToString('o')
+            waitForStartSec = $WaitForStartSec
+            staleCloseSec   = $StaleCloseSec
+            autoCloseSec    = $AutoCloseSec
+            computerName    = $env:COMPUTERNAME
+        }
+        [IO.File]::WriteAllText((Join-Path $clientWork 'update_screen_config.js'), "window.UPDATE_SCREEN_CONFIG = $($screenCfg | ConvertTo-Json -Compress);", $utf8)
+        $cfg.startUrl = ([Uri]$page).AbsoluteUri
+        [IO.File]::WriteAllText($clientConfig, ($cfg | ConvertTo-Json -Depth 20), $utf8)
+        [IO.File]::WriteAllText($clientOriginal, ($client | ConvertTo-Json), $utf8)
+
+        Stop-HmiClient
+        if (-not (Start-HmiClient $client.Exe "--config-path=`"$clientConfig`"")) {
+            # Never leave the machine without its HMI: start the UI Client the way it was.
+            [void](Start-HmiClient $client.Exe $client.Arguments)
+            throw 'The TF1200 UI Client did not start with the status page; restarted it normally.'
+        }
+
+        if ($Demo) {   # feed the page simulated progress until the demo has played out
+            $until = [DateTime]::UtcNow.AddSeconds(150)
+            while ([DateTime]::UtcNow -lt $until) {
+                [IO.File]::WriteAllText($progressJs, "updateProgress($(Get-DemoProgress | ConvertTo-Json -Compress));", $utf8)
+                Start-Sleep -Milliseconds 500
+            }
+        }
+    }
+
+    if ($Mode -ne 'Window') {
+        $client = Get-HmiClient
+        if ($client) { Show-InHmiClient $client; return }
+        if ($Mode -eq 'HmiClient') { throw 'No TF1200 UI Client is running in this session.' }
+    }
+
+    # =============================================================================
+    #  PowerShell window (fallback)
+    # =============================================================================
     $window = New-Object Windows.Window
     $window.Title = 'System update'
     $window.Background = [Windows.Media.Brushes]::Black

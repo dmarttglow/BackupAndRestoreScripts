@@ -6,14 +6,23 @@
 <meta charset="utf-8">
 <title>System update</title>
 <!--
-  Status screen shown on the machine IPC while Apply-Update runs.
-  Rendered by Show-UpdateScreen.ps1 in a WPF WebBrowser control (Internet
-  Explorer 11 engine), so keep the CSS/JS IE11-compatible: no CSS variables,
-  no grid, no arrow functions / let / const / template strings.
-  Show-UpdateScreen.ps1 calls updateStatus(json) about twice a second.
-  The Close button navigates to http://updatescreen.close/, which the host
-  intercepts to close the window.
+  Status screen shown on the machine IPC while Apply-Update runs. Two hosts:
+
+  1. TF1200 UI Client (normal case). Show-UpdateScreen.ps1 copies this page to
+     %TEMP%\TwinCAT_UpdateScreen\ next to update_screen_config.js, which sets
+     window.UPDATE_SCREEN_CONFIG, and restarts the UI Client on it. The page then
+     runs by itself: it reloads <LocalBackupRoot>\update_progress.js twice a second
+     (that script calls updateProgress({...})), and "closing" the screen means
+     going back to the HMI page the UI Client normally shows.
+  2. PowerShell window (fallback when no UI Client is running): a WPF WebBrowser
+     control (Internet Explorer 11 engine) that calls updateStatus(json) about
+     twice a second. The Close button navigates to http://updatescreen.close/,
+     which the window intercepts to close itself.
+
+  Because of host 2, keep the CSS/JS IE11-compatible: no CSS variables, no grid,
+  no arrow functions / let / const / template strings.
 -->
+<script src="update_screen_config.js"></script>
 <style>
 html, body { margin: 0; height: 100%; overflow: hidden; }
 body {
@@ -192,10 +201,14 @@ function setIcon(name) {
     for (var i = 0; i < all.length; i++) { el('ico' + all[i]).style.display = (all[i] === name) ? 'block' : 'none'; }
 }
 
-// Called by the host with a JSON string (see Get-ViewModel in Show-UpdateScreen.ps1).
+// Called by the PowerShell window with a JSON string (see Get-ViewModel in Show-UpdateScreen.ps1).
 function updateStatus(json) {
     var s;
     try { s = JSON.parse(json); } catch (e) { return; }
+    render(s);
+}
+
+function render(s) {
     var cls = 'running', icon = 'Running', title, sub, warn, warnSmall, showWarn = true;
     var rebooting = s.RebootInSec !== null && s.RebootInSec !== undefined;
     var restartText = rebooting
@@ -264,6 +277,99 @@ function updateStatus(json) {
     setText('footRight', right);
     setText('footLeft', (s.ComputerName || '') + '  -  TwinCAT update');
 }
+
+// ---------------------------------------------------------------------------
+//  TF1200 UI Client mode: the page reads the progress itself.
+//  Same rules as Get-ViewModel in Show-UpdateScreen.ps1 - keep the two in step.
+// ---------------------------------------------------------------------------
+(function clientMode() {
+    var cfg = window.UPDATE_SCREEN_CONFIG;
+    if (!cfg || !cfg.progressScript) { return; }
+
+    var autoCloseSec = cfg.autoCloseSec || { Success: 20, Failed: 120, RolledBack: 120, RollbackFailed: -1 };
+    var staleCloseSec = cfg.staleCloseSec || 600;
+    var waitForStartSec = cfg.waitForStartSec || 90;
+    var uiStart = new Date().getTime();
+    var notBefore = parseUtc(cfg.notBeforeUtc) || (uiStart - 60000);
+    var progress = null, finalRunId = null, finalSeenAt = null, leaving = false;
+
+    // .NET writes 7 fractional digits ("o" format); keep 3 so every engine parses it.
+    function parseUtc(v) {
+        if (!v) { return null; }
+        var t = Date.parse(String(v).replace(/(\.\d{3})\d+/, '$1'));
+        return isNaN(t) ? null : t;
+    }
+
+    function backToHmi() {
+        if (leaving) { return; }
+        leaving = true;
+        if (cfg.returnUrl) { window.location.href = cfg.returnUrl; }
+    }
+    el('closeBtn').href = cfg.returnUrl || '#';
+    el('closeBtn').onclick = function () { backToHmi(); return false; };
+
+    // update_progress.js calls this.
+    window.updateProgress = function (p) { progress = p; };
+
+    var tag = null;
+    function poll() {
+        if (tag && tag.parentNode) { tag.parentNode.removeChild(tag); }
+        tag = document.createElement('script');
+        tag.src = cfg.progressScript + '?t=' + new Date().getTime();
+        document.getElementsByTagName('head')[0].appendChild(tag);
+    }
+
+    function viewModel(now) {
+        var vm = {
+            Phase: 'waiting', State: 'Running', StepKey: '', Step: '', Detail: '', Percent: 0, ErrorText: '',
+            ComputerName: cfg.computerName || '', ElapsedSec: Math.floor((now - uiStart) / 1000),
+            StaleSec: 0, RebootInSec: null, AutoCloseInSec: null, CanClose: false
+        };
+        var p = progress, started = p ? parseUtc(p.StartedUtc) : null;
+        // Only an update that started around or after this screen counts (not the result of an old one).
+        if (!p || !started || started < notBefore) {
+            if (vm.ElapsedSec >= waitForStartSec) { vm.AutoCloseInSec = 0; }
+            return vm;
+        }
+        var keys = ['State', 'StepKey', 'Step', 'Detail', 'Percent', 'ErrorText', 'ComputerName'];
+        for (var i = 0; i < keys.length; i++) { if (p[keys[i]] !== null && p[keys[i]] !== undefined) { vm[keys[i]] = p[keys[i]]; } }
+        vm.ElapsedSec = Math.floor((now - started) / 1000);
+        var updated = parseUtc(p.UpdatedUtc);
+
+        if (p.State === 'Running') {
+            vm.Phase = 'running';
+            finalRunId = null;
+            if (updated) { vm.StaleSec = Math.max(0, Math.floor((now - updated) / 1000)); }
+            if (vm.StaleSec >= staleCloseSec) { vm.CanClose = true; }
+            return vm;
+        }
+
+        vm.Phase = 'final';
+        if (finalRunId !== p.RunId) { finalRunId = p.RunId; finalSeenAt = now; }
+        var rebootAt = parseUtc(p.RebootAtUtc);
+        if (rebootAt && now < rebootAt + 90000) {
+            // Reboot pending: no Close button, the controller is about to restart.
+            vm.RebootInSec = Math.max(0, Math.ceil((rebootAt - now) / 1000));
+            return vm;
+        }
+        // Result without reboot (or the reboot was cancelled).
+        vm.CanClose = true;
+        var wait = autoCloseSec[p.State];
+        if (wait === null || wait === undefined) { wait = 120; }
+        var since = (rebootAt && rebootAt > finalSeenAt) ? rebootAt + 90000 : finalSeenAt;
+        if (wait >= 0) { vm.AutoCloseInSec = Math.max(0, wait - Math.floor((now - since) / 1000)); }
+        return vm;
+    }
+
+    function tick() {
+        var vm = viewModel(new Date().getTime());
+        if (vm.AutoCloseInSec !== null && vm.AutoCloseInSec <= 0) { backToHmi(); return; }
+        render(vm);
+        poll();
+    }
+    tick();
+    window.setInterval(tick, 500);
+})();
 </script>
 </body>
 </html>

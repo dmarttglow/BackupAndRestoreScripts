@@ -8,16 +8,23 @@
     window can be seen. Apply-Update.bat therefore does not open the screen itself:
     it runs "schtasks /Run /TN "TwinCAT Update Screen"" and ignores the result.
     This task runs Show-UpdateScreen.ps1 in the session of the user who is logged on
-    (any member of the local Users group, e.g. the HMI auto-logon user).
+    (any member of the local Users group, e.g. the HMI auto-logon user). That switches
+    the TF1200 UI Client running there to the status page (or, if no UI Client is
+    running, opens a full-screen PowerShell window instead).
 
     If the task is not installed, Apply-Update works exactly the same, just
     without the screen.
 
 .PARAMETER Uninstall
     Remove the task.
+
+.PARAMETER IfMissing
+    Used by Apply-Update.bat: install the task only if it does not exist yet, and only if
+    this tool is on a fixed local disk (a task pointing at a USB stick stops working as
+    soon as the stick is removed). Does nothing otherwise.
 #>
 [CmdletBinding()]
-param([switch]$Uninstall)
+param([switch]$Uninstall, [switch]$IfMissing)
 
 $ErrorActionPreference = 'Stop'
 $TaskName = 'TwinCAT Update Screen'
@@ -31,7 +38,14 @@ if ($Uninstall) {
 
 $script = Join-Path $PSScriptRoot 'Show-UpdateScreen.ps1'
 if (-not (Test-Path -LiteralPath $script)) { throw "Not found: $script" }
-if ($script -notmatch '^[A-Za-z]:\\' -or (New-Object IO.DriveInfo ([IO.Path]::GetPathRoot($script))).DriveType -ne 'Fixed') {
+$onLocalDisk = $script -match '^[A-Za-z]:\\' -and (New-Object IO.DriveInfo ([IO.Path]::GetPathRoot($script))).DriveType -eq 'Fixed'
+if ($IfMissing) {
+    # Through cmd /c: schtasks writes "not found" to stderr, which would be a terminating error here.
+    & cmd.exe /c "schtasks.exe /Query /TN `"$TaskName`" >nul 2>&1"
+    if ($LASTEXITCODE -eq 0) { Write-Host "Task '$TaskName' already installed."; exit 0 }
+    if (-not $onLocalDisk) { Write-Warning "Not installing the task: the tool is not on a local disk ($script)."; exit 0 }
+}
+if (-not $onLocalDisk) {
     Write-Warning "The screen script is not on a local disk ($script). Copy the tool to a fixed local path (e.g. C:\TwinCAT_UpdateTool) and run this again from there."
 }
 
@@ -45,7 +59,7 @@ $xml = @"
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>Shows the TwinCAT update status screen (started by Apply-Update.bat). Optional: the update works without it.</Description>
+    <Description>Shows the TwinCAT update status screen in the TF1200 UI Client (started by Apply-Update.bat). Optional: the update works without it.</Description>
   </RegistrationInfo>
   <Triggers />
   <Principals>
@@ -93,7 +107,7 @@ try {
 }
 Write-Host ''
 Write-Host "Task '$TaskName' installed. It runs: $script"
-Write-Host 'Test it: the screen shows "Preparing system update" and closes after 90 s if no update starts:'
-Write-Host "    schtasks /Run /TN `"$TaskName`""
-Write-Host 'Preview all screens without an update (windowed, simulated progress):'
-Write-Host "    powershell -STA -ExecutionPolicy Bypass -File `"$script`" -Demo -Windowed"
+Write-Host 'Preview without an update (simulated progress, ends back on the HMI page after about 2.5 min):'
+Write-Host "    powershell -STA -ExecutionPolicy Bypass -File `"$script`" -Demo"
+Write-Host 'The same in the PowerShell window instead of the TF1200 UI Client:'
+Write-Host "    powershell -STA -ExecutionPolicy Bypass -File `"$script`" -Demo -Mode Window -Windowed"
