@@ -441,11 +441,16 @@ function Compare-Versions {
 }
 
 # Connects to the local TwinCAT system service through the .NET ADS API
-# (TwinCAT.Ads.dll), which ships with TwinCAT 3. Tries the GAC, then v4.x copies
-# (self-contained, TcAdsClient), then newer ones (v6+/AdsClient, which may fail
-# if their dependency DLLs are not alongside).
+# (TwinCAT.Ads.dll). Tries the copy bundled next to Config.ps1 first (v4.x,
+# self-contained), then the GAC, and only if neither works searches the TwinCAT
+# install folders: v4.x copies (TcAdsClient) first, then newer ones
+# (v6+/AdsClient, which may fail if their dependency DLLs are not alongside).
 function Initialize-Ads {
     if ($script:AdsClient) { return }
+
+    $bundled = Join-Path (Split-Path -Parent $PSScriptRoot) 'TwinCAT.Ads.dll'
+    $quick = @(@($bundled) | Where-Object { Test-Path -LiteralPath $_ }) + @('GAC')
+    if (Connect-AdsFrom $quick) { return }
 
     $roots = @($env:TWINCAT3DIR, 'C:\TwinCAT', "${env:ProgramFiles(x86)}\Beckhoff\TwinCAT", "$env:ProgramFiles\Beckhoff") |
         Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -Unique
@@ -464,9 +469,18 @@ function Initialize-Ads {
         } |
         Sort-Object @{ Expression = { $_.Version.Major -ne 4 } }, @{ Expression = { $_.Version }; Descending = $true } |
         Where-Object { if ($seen.ContainsKey("$($_.Version)")) { $false } else { $seen["$($_.Version)"] = 1; $true } } |
-        ForEach-Object { $_.Path })
+        ForEach-Object { $_.Path } |
+        Where-Object { $_ -ne $bundled })
 
-    foreach ($source in @('GAC') + $dlls) {
+    if (Connect-AdsFrom $dlls) { return }
+    throw ("No usable TwinCAT.Ads.dll found (tried $bundled, the GAC and $($roots -join ', ')), " +
+           'or the local ADS router did not answer. Check TwinCAT is installed and its system service is running.')
+}
+
+# Tries each source ('GAC' or a DLL path) in order; on the first one that loads
+# and gets an answer from the local ADS router, stores the client and returns $true.
+function Connect-AdsFrom([string[]]$Sources) {
+    foreach ($source in $Sources) {
         $client = $null
         try {
             $asm = if ($source -eq 'GAC') { [Reflection.Assembly]::LoadWithPartialName('TwinCAT.Ads') } else { [Reflection.Assembly]::LoadFrom($source) }
@@ -480,14 +494,13 @@ function Initialize-Ads {
             $script:AdsClient = $client
             $script:AdsAssembly = $asm
             Write-Log "ADS: using TwinCAT.Ads $($asm.GetName().Version) ($source)"
-            return
+            return $true
         } catch {
             Write-Log "ADS: TwinCAT.Ads from $source not usable: $($_.Exception.Message)"
             if ($client) { try { $client.Dispose() } catch { } }
         }
     }
-    throw ("No usable TwinCAT.Ads.dll found (searched the GAC and $($roots -join ', ')), " +
-           'or the local ADS router did not answer. Check TwinCAT is installed and its system service is running.')
+    $false
 }
 
 function Get-TwinCATState {

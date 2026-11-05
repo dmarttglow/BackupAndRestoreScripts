@@ -18,7 +18,7 @@ scripts\Install-UpdatePackage.ps1             machine logic
 1. **Check the paths in `Config.ps1`** against a real IPC. The first folder that exists is used, and the log shows which one.
    - Boot: `C:\ProgramData\Beckhoff\TwinCAT\3.1\Boot` (4026) or `C:\TwinCAT\3.1\Boot` (4024)
    - HMI: `C:\ProgramData\Beckhoff\TF2000 TwinCAT 3 HMI Server` or `C:\TwinCAT\Functions\TF2000-HMI-Server\service`
-2. **No extra software is needed for ADS.** The scripts use the .NET ADS API (`TwinCAT.Ads.dll`) that comes with TwinCAT 3. They search the GAC and the TwinCAT install folders, preferring the self-contained v4.x DLL. On the machine, the DLL is found and connected before anything is stopped. If it can't be found, the update stops and nothing is changed. To check an IPC, especially a runtime-only (XAR) image:
+2. **No extra software is needed for ADS.** The scripts use the .NET ADS API (`TwinCAT.Ads.dll`) that comes with TwinCAT 3. A self-contained v4.x copy is bundled next to `Config.ps1` and is tried first. If it doesn't work, they try the GAC, then search the TwinCAT install folders, preferring v4.x DLLs. On the machine, the DLL is found and connected before anything is stopped. If it can't be found, the update stops and nothing is changed. To check an IPC, especially a runtime-only (XAR) image:
    ```powershell
    Get-ChildItem 'C:\TwinCAT','C:\Program Files (x86)\Beckhoff' -Recurse -Filter TwinCAT.Ads.dll -EA 0 | Select FullName
    ```
