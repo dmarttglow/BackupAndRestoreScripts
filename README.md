@@ -14,7 +14,7 @@ You build the software on a **bench system**, then put it on each **machine IPC*
 2. **At the machine:** plug in the stick and press the update button on the HMI. The PLC runs `Apply-Update.bat`, which:
    - unzips the package to a local folder, checks it is complete and that the TwinCAT / TF2000 versions match this machine (if anything is wrong, it stops and changes nothing)
    - stops TwinCAT and the HMI Server, backs up the current version, and copies in the new one
-   - checks every file, restores the backup automatically if anything fails, then reboots
+   - checks every file, restores the backup automatically if anything fails, then switches TwinCAT back to Run mode and starts the HMI Server again (Windows; the Linux version restarts the controller)
 3. **Check the result** in `C:\TwinCAT_UpdateBackups\last_update_status.txt` on the machine, or in the log copied back to the stick under `TwinCAT_Update_Logs\`.
 
 Before the first use, check the paths in `BootFolderAndTF2000\Windows\Config.ps1`. Then copy the folder to a fixed local path on each machine (e.g. `C:\TwinCAT_UpdateTool\`). [BootFolderAndTF2000/Windows/README.md](BootFolderAndTF2000/Windows/README.md) covers the full setup, the PLC trigger code, optional arguments, logs and manual rollback.

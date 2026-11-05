@@ -14,11 +14,13 @@
     4. Backs up the current Boot + HMI folders to C:\TwinCAT_UpdateBackups\<timestamp>.
     5. Mirrors the package folders into place and verifies every file.
     6. On any failure in 4-5: rolls back automatically from the backup.
-    7. Reboots the controller.
+    7. Switches TwinCAT back to Run mode and starts the HMI Server again (no controller
+       restart, unless RebootAfterApply = $true in Config.ps1).
 
     Exit codes: 0 = updated, 1 = failed before anything was changed,
                 2 = failed and rolled back, 3 = failed AND rollback failed (manual fix needed),
-                4 = another update is already running.
+                4 = another update is already running,
+                5 = updated, but TwinCAT or the HMI Server did not start again.
 
     Result is also written to <LocalBackupRoot>\last_update_status.txt and a copy of the
     log is written to the USB stick (TwinCAT_Update_Logs, next to the zip).
@@ -29,7 +31,7 @@
     An unzipped package folder from an older version of this tool also works.
 
 .PARAMETER NoReboot
-    Do not reboot; restart the HMI Server and put TwinCAT back into Run mode instead.
+    Do not reboot even if RebootAfterApply = $true (the default is already no reboot).
 
 .PARAMETER AllowVersionMismatch
     Apply even if the XAR / TF2000 versions in the package differ from this machine
@@ -92,6 +94,42 @@ function Remove-OldBackups {
         Write-Log "Removing old backup $($o.FullName)"
         Remove-Item -LiteralPath $o.FullName -Recurse -Force -ErrorAction SilentlyContinue
     }
+}
+
+# Brings the machine back after the update (or a rollback): TwinCAT into Run mode first, so
+# the HMI Server finds the PLC straight away, then the HMI Server and any services stopped
+# with it. Each is retried once. Returns $true only if TwinCAT is in Run mode and every
+# service is running.
+function Start-MachineAgain {
+    param([string[]]$Services)
+    Set-ProgressStep restart 'Starting TwinCAT and the HMI Server' 97 99
+    $ok = $true
+    $runTimeout = [Math]::Max(60, [int]$S.AdsStateTimeoutSec)   # Config -> Run restarts the runtime: allow for big projects
+
+    $tcOk = $false
+    for ($try = 1; $try -le 2 -and -not $tcOk; $try++) {
+        try { Set-TwinCATMode -Mode Run -TimeoutSec $runTimeout; $tcOk = $true }
+        catch { Write-Log -Level WARN "TwinCAT Run mode, attempt $try of 2: $($_.Exception.Message)" }
+    }
+    if (-not $tcOk) {
+        Write-Log -Level ERROR 'TwinCAT did not go back to Run mode. Check the TwinCAT error list / licences on this machine.'
+        $ok = $false
+    }
+
+    # Always the HMI Server, even if it was not running before the update.
+    $names = @(@($Services) + @($S.HmiServiceName) | Where-Object { $_ } | Select-Object -Unique)
+    foreach ($name in $names) {
+        $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
+        if (-not $svc) { Write-Log -Level WARN "Service '$name' is not installed - not started"; continue }
+        if ("$($svc.StartType)" -eq 'Disabled') { Write-Log -Level WARN "Service '$name' is disabled - not started"; continue }
+        $started = Start-ServiceSafe -Name $name -TimeoutSec $S.ServiceStopTimeoutSec
+        if (-not $started) {
+            Start-Sleep -Seconds 5
+            $started = Start-ServiceSafe -Name $name -TimeoutSec $S.ServiceStopTimeoutSec
+        }
+        if (-not $started) { Write-Log -Level ERROR "Service '$name' did not start."; $ok = $false }
+    }
+    $ok
 }
 
 # Full restart of the controller (shutdown /r: never a Fast Startup / hybrid boot; /f: apps are
@@ -335,12 +373,29 @@ catch {
     if ($_.ScriptStackTrace) { Write-Log -Level ERROR ($_.ScriptStackTrace -replace '\r?\n', ' <- ') }
 }
 finally {
+    $rebootWanted = $false
+    if ($S -and $stopped) {
+        if ($exitCode -eq 3) {
+            Write-Log -Level ERROR 'Machine left stopped (Config mode) because the rollback failed.'
+        } elseif ($S.RebootAfterApply -and -not $NoReboot) {
+            $rebootWanted = $true
+        } else {
+            # Normal case: start TwinCAT (Run mode) and the HMI Server again, no controller restart.
+            if (-not (Start-MachineAgain -Services $servicesToStart) -and $exitCode -eq 0) {
+                $exitCode = 5
+                $errorText = 'The update was installed, but TwinCAT or the HMI Server did not start again. Restart the controller.'
+                Write-Log -Level ERROR $errorText
+            }
+        }
+    }
     $statusText = switch ($exitCode) {
         0 { 'SUCCESS' } 1 { 'FAILED - nothing changed' } 2 { 'FAILED - previous version restored' }
-        3 { 'FAILED - ROLLBACK FAILED, manual repair needed' } default { "EXIT $exitCode" }
+        3 { 'FAILED - ROLLBACK FAILED, manual repair needed' } 5 { 'UPDATED - but TwinCAT or the HMI did not start again' }
+        default { "EXIT $exitCode" }
     }
     if ($S) {
         Write-Status $S.LocalBackupRoot $statusText "Package: $pkgSource"
+        Write-Log "Result: $statusText (exit code $exitCode)"
 
         if ($stagingDir -and (Test-Path -LiteralPath $stagingDir)) {
             Remove-Item -LiteralPath $stagingDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -355,24 +410,13 @@ finally {
             } catch { Write-Log -Level WARN "Could not copy log to USB: $($_.Exception.Message)" }
         }
 
-        $progressState = switch ($exitCode) { 0 { 'Success' } 2 { 'RolledBack' } 3 { 'RollbackFailed' } default { 'Failed' } }
+        $progressState = switch ($exitCode) { 0 { 'Success' } 2 { 'RolledBack' } 3 { 'RollbackFailed' } 5 { 'StartFailed' } default { 'Failed' } }
         $rebooting = $false
-        if ($stopped) {
-            if ($exitCode -eq 3) {
-                Write-Log -Level ERROR 'Machine left stopped (Config mode) because the rollback failed. NOT rebooting.'
-            } elseif ($S.RebootAfterApply -and -not $NoReboot) {
-                $rebooting = Restart-Controller -DelaySec $S.RebootDelaySeconds -Reason "TwinCAT update: $statusText" -ProgressState $progressState -ErrorText $errorText
-            }
-            if (-not $rebooting -and $exitCode -ne 3) {
-                # No restart (not wanted, or it failed): bring the HMI Server and TwinCAT back up here.
-                Set-ProgressStep restart 'Starting TwinCAT and the HMI Server' 97 99
-                foreach ($svc in $servicesToStart) { [void](Start-ServiceSafe -Name $svc -TimeoutSec $S.ServiceStopTimeoutSec) }
-                try { Set-TwinCATMode -Mode Run -TimeoutSec $S.AdsStateTimeoutSec }
-                catch { Write-Log -Level ERROR "Could not switch TwinCAT to Run mode: $($_.Exception.Message)" }
-            }
+        if ($rebootWanted) {   # only with RebootAfterApply = $true
+            $rebooting = Restart-Controller -DelaySec $S.RebootDelaySeconds -Reason "TwinCAT update: $statusText" -ProgressState $progressState -ErrorText $errorText
+            if (-not $rebooting) { [void](Start-MachineAgain -Services $servicesToStart) }
         }
         if (-not $rebooting) { Set-ProgressResult -State $progressState -ErrorText $errorText }
-        Write-Log "Result: $statusText (exit code $exitCode)"
     }
     Close-Ads
     if ($mutex) { $mutex.ReleaseMutex(); $mutex.Dispose() }

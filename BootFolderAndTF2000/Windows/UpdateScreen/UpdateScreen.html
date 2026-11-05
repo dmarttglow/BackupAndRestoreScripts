@@ -139,7 +139,7 @@ body.st-error .warn small { color: #e8a9a4; }
 
     <div class="warn" id="warn">
         <span id="warnText">Do not switch off the power or remove the USB stick.</span>
-        <small id="warnSmall">The machine will restart by itself when the update is finished.</small>
+        <small id="warnSmall">The HMI comes back by itself when the update is finished.</small>
     </div>
 
     <div class="bar"><div class="fill" id="fill"></div></div>
@@ -159,7 +159,7 @@ body.st-error .warn small { color: #e8a9a4; }
 <script>
 var STEPS = [
     ['check', 'Check'], ['unpack', 'Unpack'], ['verify', 'Verify package'], ['stop', 'Stop TwinCAT'],
-    ['backup', 'Back up'], ['install', 'Install'], ['verifyinstall', 'Verify'], ['restart', 'Restart']
+    ['backup', 'Back up'], ['install', 'Install'], ['verifyinstall', 'Verify'], ['restart', 'Start TwinCAT']
 ];
 // Map step keys that are not in the list above onto a list position.
 var STEP_ALIAS = { rollback: 'install' };
@@ -218,15 +218,16 @@ function render(s) {
     if (s.Phase === 'waiting') {
         title = 'Preparing system update'; sub = 'Please wait.';
         warn = 'Do not switch off the power or remove the USB stick.';
-        warnSmall = 'The machine will restart by itself when the update is finished.';
+        warnSmall = 'The HMI comes back by itself when the update is finished.';
     } else if (s.Phase === 'running') {
         title = 'System update in progress';
-        sub = s.StepKey === 'rollback' ? 'A problem was found. The previous version is being restored.' : 'The machine is being updated. This can take several minutes.';
+        sub = s.StepKey === 'rollback' ? 'A problem was found. The previous version is being restored.'
+            : (s.StepKey === 'restart' ? 'Starting TwinCAT and the HMI Server again.' : 'The machine is being updated. This can take several minutes.');
         warn = 'Do not switch off the power or remove the USB stick.';
-        warnSmall = 'The machine will restart by itself when the update is finished.';
+        warnSmall = 'The HMI comes back by itself when the update is finished.';
     } else if (s.State === 'Success') {
         cls = 'success'; icon = 'Success'; title = 'Update complete';
-        sub = rebooting ? restartText : 'The machine is ready.';
+        sub = rebooting ? restartText : 'TwinCAT is running again. The USB stick can be removed.';
         warn = 'Do not switch off the power.'; warnSmall = 'Wait until the controller has restarted.';
         showWarn = rebooting;
     } else if (s.State === 'Failed') {
@@ -238,6 +239,10 @@ function render(s) {
         sub = rebooting ? restartText : 'The machine is running the previous version again.';
         warn = 'Do not switch off the power.'; warnSmall = 'Wait until the controller has restarted.';
         showWarn = rebooting;
+    } else if (s.State === 'StartFailed') {
+        cls = 'warning'; icon = 'Warning'; title = 'Update installed - TwinCAT did not start';
+        sub = 'The new version is installed, but TwinCAT or the HMI Server did not start again.';
+        warn = 'Restart the controller.'; warnSmall = 'If the problem stays after the restart, contact maintenance (see the update log).';
     } else {   // RollbackFailed
         cls = 'error'; icon = 'Error'; title = 'Update failed - service needed';
         sub = 'The previous version could not be restored. TwinCAT has been left stopped.';
@@ -265,7 +270,7 @@ function render(s) {
     showAs('closeBtn', !!s.CanClose, 'inline-block');
     var ac = s.AutoCloseInSec !== null && s.AutoCloseInSec !== undefined;
     showAs('autoclose', ac, 'inline');
-    if (ac) { setText('autoclose', 'This screen closes in ' + s.AutoCloseInSec + ' s'); }
+    if (ac) { setText('autoclose', (window.UPDATE_SCREEN_CONFIG ? 'Returning to the HMI in ' : 'This screen closes in ') + s.AutoCloseInSec + ' s'); }
 
     var right = 'Elapsed ' + fmtTime(s.ElapsedSec);
     if (s.Phase === 'running' && s.StaleSec >= 30) {
@@ -361,10 +366,22 @@ function render(s) {
         return vm;
     }
 
+    // Show-UpdateScreen.ps1 normally takes the UI Client back to the HMI itself (once the HMI
+    // Server answers, by restarting the UI Client with its normal configuration). Going back
+    // from the page is only the fallback if that has not happened a while later.
+    var closeDueAt = null, fallbackMs = (cfg.helperReturnsToHmi ? 120 : 0) * 1000;
     function tick() {
-        var vm = viewModel(new Date().getTime());
-        if (vm.AutoCloseInSec !== null && vm.AutoCloseInSec <= 0) { backToHmi(); return; }
-        render(vm);
+        var now = new Date().getTime(), vm = viewModel(now);
+        if (vm.AutoCloseInSec !== null && vm.AutoCloseInSec <= 0) {
+            if (closeDueAt === null) { closeDueAt = now; }
+            if (now - closeDueAt >= fallbackMs) { backToHmi(); return; }
+            vm.AutoCloseInSec = null;
+            render(vm);
+            showAs('autoclose', true, 'inline');
+            setText('autoclose', 'Returning to the HMI - waiting for the HMI Server...');
+        } else {
+            render(vm);
+        }
         poll();
     }
     tick();

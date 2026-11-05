@@ -4,11 +4,13 @@
 ::  Unattended: intended to be started by the PLC (NT_StartProcess) from an
 ::  HMI button. Validates the package, stops TwinCAT (ADS -> Config) + HMI
 ::  Server, backs up the old version, replaces Boot + HMI folders, verifies,
-::  rolls back on failure, then reboots.
+::  rolls back on failure, then puts TwinCAT back into Run mode and starts the
+::  HMI Server again.
 ::
 ::  Result: C:\TwinCAT_UpdateBackups\last_update_status.txt
 ::  Exit codes: 0 ok, 1 failed (nothing changed), 2 failed (rolled back),
-::              3 failed + rollback failed, 4 already running
+::              3 failed + rollback failed, 4 already running,
+::              5 updated but TwinCAT / HMI Server did not start again
 :: ============================================================================
 setlocal
 

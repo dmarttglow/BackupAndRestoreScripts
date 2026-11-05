@@ -19,8 +19,10 @@ $Settings = @{
     # overwriting it with the bench's values. See README before changing.
     PreservePersistentData   = $true
 
-    # Reboot the machine at the end of Apply-Update (also after a rollback).
-    RebootAfterApply         = $true
+    # $false (default): at the end of Apply-Update, switch TwinCAT back to Run mode and
+    # start the HMI Server again - no controller restart.
+    # $true: restart the whole controller instead (also after a rollback).
+    RebootAfterApply         = $false
     RebootDelaySeconds       = 10
 
     # Timeouts (seconds)

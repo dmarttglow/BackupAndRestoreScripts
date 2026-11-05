@@ -107,7 +107,7 @@ try {
 }
 Write-Host ''
 Write-Host "Task '$TaskName' installed. It runs: $script"
-Write-Host 'Preview without an update (simulated progress, ends back on the HMI page after about 2.5 min):'
+Write-Host 'Preview without an update (simulated progress, goes back to the HMI page after about 45 s):'
 Write-Host "    powershell -STA -ExecutionPolicy Bypass -File `"$script`" -Demo"
 Write-Host 'The same in the PowerShell window instead of the TF1200 UI Client:'
 Write-Host "    powershell -STA -ExecutionPolicy Bypass -File `"$script`" -Demo -Mode Window -Windowed"

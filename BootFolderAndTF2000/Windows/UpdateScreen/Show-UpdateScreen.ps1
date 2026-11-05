@@ -55,14 +55,14 @@ param(
     [int]$WaitForStartSec = 90,
     [switch]$Windowed,
     [switch]$Demo,
-    [ValidateSet('Success', 'Failed', 'RolledBack', 'RollbackFailed')][string]$DemoResult = 'Success',
+    [ValidateSet('Success', 'Failed', 'RolledBack', 'StartFailed', 'RollbackFailed')][string]$DemoResult = 'Success',
     [int]$CloseAfterSec = 0
 )
 
 $ErrorActionPreference = 'Stop'
 
 # --- Seconds the result stays on screen before closing by itself (-1 = never) ---
-$AutoCloseSec = @{ Success = 20; Failed = 120; RolledBack = 120; RollbackFailed = -1 }
+$AutoCloseSec = @{ Success = 15; Failed = 120; RolledBack = 120; StartFailed = 120; RollbackFailed = -1 }
 $StaleCloseSec = 600   # no progress for this long while "running": offer the Close button
 
 # --- Single instance per session ---------------------------------------------------
@@ -120,7 +120,7 @@ try {
             @('check', 'Looking for the update package', 0, 3), @('unpack', 'Unpacking the update package', 3, 20),
             @('verify', 'Verifying the update package', 20, 35), @('stop', 'Stopping TwinCAT and the HMI Server', 35, 40),
             @('backup', 'Backing up the current version', 40, 60), @('install', 'Installing the new version', 60, 75),
-            @('verifyinstall', 'Verifying the installed files', 75, 97))
+            @('verifyinstall', 'Verifying the installed files', 75, 97), @('restart', 'Starting TwinCAT and the HMI Server', 97, 99))
         $per = 3.0
         $failAt = switch ($DemoResult) { 'Failed' { 2 } 'RolledBack' { 6 } 'RollbackFailed' { 6 } default { 99 } }
         $p = [ordered]@{ RunId = 'demo'; ComputerName = $env:COMPUTERNAME; State = 'Running'; StepKey = ''; Step = ''; Detail = ''
@@ -147,8 +147,8 @@ try {
             'Failed'         { $p.ErrorText = 'Installed versions do not match the package (1 mismatch(es)). Nothing was changed.' }
             'RolledBack'     { $p.ErrorText = 'Update failed; previous version restored.' }
             'RollbackFailed' { $p.ErrorText = 'Update failed and rollback failed. Restore manually from C:\TwinCAT_UpdateBackups\20261105_101500_before_update' }
+            'StartFailed'    { $p.ErrorText = 'The update was installed, but TwinCAT or the HMI Server did not start again. Restart the controller.' }
         }
-        if ($DemoResult -in 'Success', 'RolledBack') { $p.RebootAtUtc = $script:uiStart.AddSeconds($done + 15).ToString('o') }
         [pscustomobject]$p
     }
 
@@ -293,6 +293,7 @@ try {
             staleCloseSec   = $StaleCloseSec
             autoCloseSec    = $AutoCloseSec
             computerName    = $env:COMPUTERNAME
+            helperReturnsToHmi = $true
         }
         [IO.File]::WriteAllText((Join-Path $clientWork 'update_screen_config.js'), "window.UPDATE_SCREEN_CONFIG = $($screenCfg | ConvertTo-Json -Compress);", $utf8)
         $cfg.startUrl = ([Uri]$page).AbsoluteUri
@@ -306,12 +307,34 @@ try {
             throw 'The TF1200 UI Client did not start with the status page; restarted it normally.'
         }
 
-        if ($Demo) {   # feed the page simulated progress until the demo has played out
-            $until = [DateTime]::UtcNow.AddSeconds(150)
-            while ([DateTime]::UtcNow -lt $until) {
-                [IO.File]::WriteAllText($progressJs, "updateProgress($(Get-DemoProgress | ConvertTo-Json -Compress));", $utf8)
-                Start-Sleep -Milliseconds 500
-            }
+        # Follow the update (same rules as the page). When the page would close, take the UI
+        # Client back to the HMI: wait until the HMI Server answers, then restart the UI Client
+        # with its normal configuration, so its own retry settings apply from then on.
+        $giveUpAt = [DateTime]::UtcNow.AddHours(4)
+        while ([DateTime]::UtcNow -lt $giveUpAt) {
+            if ($Demo) { [IO.File]::WriteAllText($progressJs, "updateProgress($(Get-DemoProgress | ConvertTo-Json -Compress));", $utf8) }
+            $vm = Get-ViewModel
+            if ($null -ne $vm.AutoCloseInSec -and $vm.AutoCloseInSec -le 0) { break }
+            Start-Sleep -Milliseconds 500
+        }
+        Wait-HmiReachable $screenCfg.returnUrl 120
+        Stop-HmiClient
+        if (-not (Start-HmiClient $client.Exe $client.Arguments)) { throw 'The TF1200 UI Client did not start again with its normal configuration.' }
+    }
+
+    # Waits until the HMI web server accepts connections (http/https start pages only).
+    function Wait-HmiReachable([string]$url, [int]$timeoutSec) {
+        $u = $null
+        try { $u = [Uri]$url } catch { return }
+        if ($u.Scheme -notin 'http', 'https') { return }
+        $until = [DateTime]::UtcNow.AddSeconds($timeoutSec)
+        while ([DateTime]::UtcNow -lt $until) {
+            $tcp = New-Object Net.Sockets.TcpClient
+            try {
+                $ar = $tcp.BeginConnect($u.Host, $u.Port, $null, $null)
+                if ($ar.AsyncWaitHandle.WaitOne(2000) -and $tcp.Connected) { Start-Sleep -Seconds 3; return }   # 3 s: let the server finish starting
+            } catch { } finally { $tcp.Close() }
+            Start-Sleep -Seconds 2
         }
     }
 
