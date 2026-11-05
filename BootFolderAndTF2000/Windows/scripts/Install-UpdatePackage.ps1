@@ -15,12 +15,14 @@
     5. Mirrors the package folders into place and verifies every file.
     6. On any failure in 4-5: rolls back automatically from the backup.
     7. Switches TwinCAT back to Run mode and starts the HMI Server again (no controller
-       restart, unless RebootAfterApply = $true in Config.ps1).
+       restart, unless RebootAfterApply = $true in Config.ps1). If either does not come
+       back, restarts the controller (RebootIfStartFails = $true).
 
     Exit codes: 0 = updated, 1 = failed before anything was changed,
                 2 = failed and rolled back, 3 = failed AND rollback failed (manual fix needed),
                 4 = another update is already running,
-                5 = updated, but TwinCAT or the HMI Server did not start again.
+                5 = updated, but TwinCAT or the HMI Server did not start again
+                    (the controller is restarted, see RebootIfStartFails).
 
     Result is also written to <LocalBackupRoot>\last_update_status.txt and a copy of the
     log is written to the USB stick (TwinCAT_Update_Logs, next to the zip).
@@ -122,10 +124,10 @@ function Start-MachineAgain {
         $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
         if (-not $svc) { Write-Log -Level WARN "Service '$name' is not installed - not started"; continue }
         if ("$($svc.StartType)" -eq 'Disabled') { Write-Log -Level WARN "Service '$name' is disabled - not started"; continue }
-        $started = Start-ServiceSafe -Name $name -TimeoutSec $S.ServiceStopTimeoutSec
+        $started = Start-ServiceSafe -Name $name -TimeoutSec $S.ServiceStartTimeoutSec
         if (-not $started) {
             Start-Sleep -Seconds 5
-            $started = Start-ServiceSafe -Name $name -TimeoutSec $S.ServiceStopTimeoutSec
+            $started = Start-ServiceSafe -Name $name -TimeoutSec $S.ServiceStartTimeoutSec
         }
         if (-not $started) { Write-Log -Level ERROR "Service '$name' did not start."; $ok = $false }
     }
@@ -374,6 +376,7 @@ catch {
 }
 finally {
     $rebootWanted = $false
+    $startFailed = $false
     if ($S -and $stopped) {
         if ($exitCode -eq 3) {
             Write-Log -Level ERROR 'Machine left stopped (Config mode) because the rollback failed.'
@@ -381,16 +384,24 @@ finally {
             $rebootWanted = $true
         } else {
             # Normal case: start TwinCAT (Run mode) and the HMI Server again, no controller restart.
-            if (-not (Start-MachineAgain -Services $servicesToStart) -and $exitCode -eq 0) {
-                $exitCode = 5
-                $errorText = 'The update was installed, but TwinCAT or the HMI Server did not start again. Restart the controller.'
-                Write-Log -Level ERROR $errorText
+            if (-not (Start-MachineAgain -Services $servicesToStart)) {
+                # They did not come back: restart the whole controller, which starts both from scratch.
+                $startFailed = $true
+                $rebootWanted = $S.RebootIfStartFails -and -not $NoReboot
+                if ($exitCode -eq 0) {
+                    $exitCode = 5
+                    $errorText = if ($rebootWanted) { 'The update was installed, but TwinCAT or the HMI Server did not start again. Restarting the controller.' }
+                                 else { 'The update was installed, but TwinCAT or the HMI Server did not start again. Restart the controller.' }
+                }
+                Write-Log -Level ERROR ('TwinCAT or the HMI Server did not start again. ' +
+                    $(if ($rebootWanted) { 'Restarting the controller.' } else { 'Not restarting the controller (RebootIfStartFails off or -NoReboot) - restart it by hand.' }))
             }
         }
     }
     $statusText = switch ($exitCode) {
         0 { 'SUCCESS' } 1 { 'FAILED - nothing changed' } 2 { 'FAILED - previous version restored' }
-        3 { 'FAILED - ROLLBACK FAILED, manual repair needed' } 5 { 'UPDATED - but TwinCAT or the HMI did not start again' }
+        3 { 'FAILED - ROLLBACK FAILED, manual repair needed' }
+        5 { if ($rebootWanted) { 'UPDATED - TwinCAT or the HMI did not start, controller restarted' } else { 'UPDATED - but TwinCAT or the HMI did not start again' } }
         default { "EXIT $exitCode" }
     }
     if ($S) {
@@ -412,9 +423,15 @@ finally {
 
         $progressState = switch ($exitCode) { 0 { 'Success' } 2 { 'RolledBack' } 3 { 'RollbackFailed' } 5 { 'StartFailed' } default { 'Failed' } }
         $rebooting = $false
-        if ($rebootWanted) {   # only with RebootAfterApply = $true
+        if ($rebootWanted) {   # RebootAfterApply = $true, or TwinCAT / the HMI Server did not start again
             $rebooting = Restart-Controller -DelaySec $S.RebootDelaySeconds -Reason "TwinCAT update: $statusText" -ProgressState $progressState -ErrorText $errorText
-            if (-not $rebooting) { [void](Start-MachineAgain -Services $servicesToStart) }
+            if (-not $rebooting -and -not $startFailed) { [void](Start-MachineAgain -Services $servicesToStart) }
+            if (-not $rebooting -and $startFailed) {
+                $errorText = 'The update was installed, but TwinCAT or the HMI Server did not start again, and the controller could not be restarted. Restart it by hand.'
+                $statusText = 'UPDATED - TwinCAT or the HMI did not start, RESTART FAILED - restart by hand'
+                Write-Status $S.LocalBackupRoot $statusText "Package: $pkgSource"
+                Write-Log -Level ERROR "Result: $statusText (exit code $exitCode)"
+            }
         }
         if (-not $rebooting) { Set-ProgressResult -State $progressState -ErrorText $errorText }
     }

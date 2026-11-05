@@ -73,12 +73,14 @@ powershell -STA -ExecutionPolicy Bypass -File UpdateScreen\Show-UpdateScreen.ps1
 
 ## Starting again after the update
 
-The controller is **not** restarted. After a successful update (and after a rollback) Apply-Update:
+Normally the controller is **not** restarted. After a successful update (and after a rollback) Apply-Update:
 
 1. switches TwinCAT back to **Run** mode via ADS. This restarts the runtime, which loads the new Boot folder, so the PLC boot project needs *Autostart* enabled, as for a normal power-up. It waits up to 60 s and tries a second time if needed;
 2. then starts the **HMI Server** (`TcHmiSrv`), even if it wasn't running before, and any services stopped with it. A service that doesn't start is retried once.
 
-If either one fails, the update is still installed, but the result is `UPDATED - but TwinCAT or the HMI did not start again` (exit code 5). The status screen then says *Restart the controller*, and the log has the TwinCAT / service error. A rollback that failed leaves TwinCAT in Config mode for service.
+A service that is already starting (*Start Pending*) is waited for, up to `ServiceStartTimeoutSec` (180 s), not started a second time.
+
+**If either one still fails, the controller restarts itself** (`RebootIfStartFails = $true`, the default). The restart starts TwinCAT and the HMI Server from scratch. The update stays installed: the result is `UPDATED - TwinCAT or the HMI did not start, controller restarted` (exit code 5), and the status screen shows *restarting the controller* with a countdown. The log, also copied to the stick before the restart, has the TwinCAT / service error. The same applies after a rollback. With `RebootIfStartFails = $false` (or `-NoReboot`), the screen says *Restart the controller* instead. A rollback that failed leaves TwinCAT in Config mode for service and never restarts.
 
 To restart the whole controller instead (the older behaviour), set `RebootAfterApply = $true` in `Config.ps1`. Apply-Update then runs a full restart (`shutdown /r /f`) `RebootDelaySeconds` after the result. If Windows refuses the restart, Apply-Update falls back to `Restart-Computer -Force`, and if that fails too, it starts TwinCAT and the HMI Server as above.
 
@@ -112,7 +114,7 @@ Set the environment variable `NOPAUSE=1` to stop `Create-UpdatePackage.bat` wait
 - `C:\TwinCAT_UpdateBackups\Logs\Apply_<time>.log`. A copy also goes to `<USB>:\TwinCAT_Update_Logs\`.
 - `C:\TwinCAT_UpdateBackups\<time>_before_update\`: the old Boot and HMI folders. The last 5 are kept (`BackupsToKeep`).
 
-Exit codes: 0 ok, 1 failed (nothing changed), 2 failed and rolled back, 3 rollback failed (the IPC is left in Config mode), 4 already running, 5 updated but TwinCAT or the HMI Server did not start again.
+Exit codes: 0 ok, 1 failed (nothing changed), 2 failed and rolled back, 3 rollback failed (the IPC is left in Config mode), 4 already running, 5 updated but TwinCAT or the HMI Server did not start again (controller restarted, unless `RebootIfStartFails = $false`).
 
 **Manual rollback** to an old version: copy `<time>_before_update\Boot` and `\HMI` back to their folders while TwinCAT is in Config mode and `TcHmiSrv` is stopped, then reboot. Or put that folder on a stick as `TwinCAT_Update`, set `"Purpose": "UpdatePackage"` in its `manifest.json`, and run Apply-Update. Each backup has its own `versions.json`, so the version check still applies.
 

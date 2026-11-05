@@ -23,11 +23,17 @@ $Settings = @{
     # start the HMI Server again - no controller restart.
     # $true: restart the whole controller instead (also after a rollback).
     RebootAfterApply         = $false
+    # If TwinCAT does not reach Run mode or the HMI Server does not start again (after
+    # retries), restart the controller so both start from scratch.
+    RebootIfStartFails       = $true
     RebootDelaySeconds       = 10
 
     # Timeouts (seconds)
     AdsStateTimeoutSec       = 30
     ServiceStopTimeoutSec    = 60
+    # How long a starting service may stay "Start Pending" (the HMI Server can take a
+    # while to load its project after an update).
+    ServiceStartTimeoutSec   = 180
 
     # Windows service name of the TwinCAT HMI Server (TF2000).
     HmiServiceName           = 'TcHmiSrv'

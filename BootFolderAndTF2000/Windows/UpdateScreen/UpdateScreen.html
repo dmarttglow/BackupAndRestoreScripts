@@ -239,6 +239,10 @@ function render(s) {
         sub = rebooting ? restartText : 'The machine is running the previous version again.';
         warn = 'Do not switch off the power.'; warnSmall = 'Wait until the controller has restarted.';
         showWarn = rebooting;
+    } else if (s.State === 'StartFailed' && rebooting) {
+        cls = 'warning'; icon = 'Warning'; title = 'Update installed - restarting the controller';
+        sub = 'TwinCAT or the HMI Server did not start again by itself. ' + restartText;
+        warn = 'Do not switch off the power.'; warnSmall = 'TwinCAT and the HMI start again after the restart.';
     } else if (s.State === 'StartFailed') {
         cls = 'warning'; icon = 'Warning'; title = 'Update installed - TwinCAT did not start';
         sub = 'The new version is installed, but TwinCAT or the HMI Server did not start again.';

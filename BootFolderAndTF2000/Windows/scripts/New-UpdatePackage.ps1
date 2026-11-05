@@ -55,7 +55,7 @@ function Restore-BenchState {
         $script:adsUsed = $false
         return
     }
-    foreach ($svc in $script:servicesToStart) { [void](Start-ServiceSafe -Name $svc -TimeoutSec $S.ServiceStopTimeoutSec) }
+    foreach ($svc in $script:servicesToStart) { [void](Start-ServiceSafe -Name $svc -TimeoutSec $S.ServiceStartTimeoutSec) }
     $script:servicesToStart = @()
     if ($script:tcWasRunning) {
         $script:tcWasRunning = $false

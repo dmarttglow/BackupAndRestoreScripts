@@ -50,6 +50,7 @@ function Start-ProgressFile {
     $script:ProgressFile = $Path
     $script:ProgressState = [ordered]@{
         RunId        = $RunId
+        Pid          = $PID       # the status helper returns to the HMI if this process has ended
         ComputerName = $env:COMPUTERNAME
         State        = 'Running'   # Running, Success, Failed, RolledBack, RollbackFailed
         StepKey      = ''
@@ -115,18 +116,32 @@ function Save-ProgressFile {
     try {
         $script:ProgressState.UpdatedUtc = $now.ToString('o')
         $json = $script:ProgressState | ConvertTo-Json -Compress
-        Write-FileAtomic $script:ProgressFile $json
-        Write-FileAtomic ([IO.Path]::ChangeExtension($script:ProgressFile, '.js')) "updateProgress($json);"
-    } catch { }
+        # Step changes and the result (-Force) must arrive; a lost detail update is replaced a second later.
+        $tries = if ($Force) { 60 } else { 3 }
+        Write-FileAtomic $script:ProgressFile $json -Tries $tries
+        Write-FileAtomic ([IO.Path]::ChangeExtension($script:ProgressFile, '.js')) "updateProgress($json);" -Tries $tries
+    } catch { if ($Force) { Write-Log -Level WARN "Could not write the status screen file: $($_.Exception.Message)" } }
 }
 
-# Writes via a .tmp file so a reader never sees a half-written file.
+# Writes via a .tmp file so a reader never sees a half-written file. The status helper and
+# the page in the UI Client read these files twice a second: while one has the file open,
+# replacing it can fail (on older Windows a deleted file keeps its name until the reader closes
+# it), so it is retried for ~3 s and, as a last resort, overwritten in place. Losing a write
+# here (e.g. the final result) leaves the status screen stuck on the last step.
 function Write-FileAtomic {
-    param([string]$Path, [string]$Text)
+    param([string]$Path, [string]$Text, [int]$Tries = 60)
+    $utf8 = New-Object Text.UTF8Encoding $false
     $tmp = "$Path.tmp"
-    [IO.File]::WriteAllText($tmp, $Text, (New-Object Text.UTF8Encoding $false))
-    if ([IO.File]::Exists($Path)) { [IO.File]::Delete($Path) }
-    [IO.File]::Move($tmp, $Path)
+    for ($try = 1; $try -le $Tries; $try++) {
+        try {
+            [IO.File]::WriteAllText($tmp, $Text, $utf8)
+            if ([IO.File]::Exists($Path)) { [IO.File]::Replace($tmp, $Path, [NullString]::Value) } else { [IO.File]::Move($tmp, $Path) }
+            return
+        } catch { Start-Sleep -Milliseconds 50 }
+    }
+    $fs = New-Object IO.FileStream($Path, [IO.FileMode]::Create, [IO.FileAccess]::Write, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+    try { $b = $utf8.GetBytes($Text); $fs.Write($b, 0, $b.Length) } finally { $fs.Dispose() }
+    Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
 }
 
 function Clear-ProgressLine {
@@ -198,6 +213,9 @@ function Import-UpdateConfig {
     . $Path
     if (-not $Settings) { throw "Config file '$Path' does not define `$Settings." }
     if (-not $PackageItems) { throw "Config file '$Path' does not define `$PackageItems." }
+    # Settings added in later versions: defaults for Config.ps1 files from before.
+    if (-not $Settings.ServiceStartTimeoutSec) { $Settings.ServiceStartTimeoutSec = 180 }
+    if ($null -eq $Settings.RebootIfStartFails) { $Settings.RebootIfStartFails = $true }
 
     $items = foreach ($i in $PackageItems) {
         if (-not $i.Name) { throw 'A package item in the config has no Name.' }
@@ -784,19 +802,40 @@ function Stop-ServiceWithTimeout {
     $restart
 }
 
+# Starts a service and waits until it is Running. A service that is already starting
+# (Start Pending, e.g. started by Windows or by an earlier attempt) is waited for, not
+# started again: ServiceController.Start() throws for a service in that state.
 function Start-ServiceSafe {
-    param([Parameter(Mandatory = $true)][string]$Name, [int]$TimeoutSec = 60)
+    param([Parameter(Mandatory = $true)][string]$Name, [int]$TimeoutSec = 180)
     try {
         $svc = Get-Service -Name $Name -ErrorAction Stop
-        if ($svc.Status -ne 'Running') {
-            Write-Log -Level STEP "Starting service '$Name'..."
-            $svc.Start()
-            if (-not (Wait-ServiceStatus -Service $svc -Status 'Running' -TimeoutSec $TimeoutSec)) { throw "did not start within $TimeoutSec s" }
+        $svc.Refresh()
+        if ("$($svc.Status)" -eq 'StopPending') {
+            Write-Log "Service '$Name' is still stopping - waiting before starting it"
+            [void](Wait-ServiceStatus -Service $svc -Status 'Stopped' -TimeoutSec $TimeoutSec)
+        }
+        switch ("$($svc.Status)") {
+            'Running'      { }
+            'StartPending' { Write-Log -Level STEP "Service '$Name' is already starting (Start Pending) - waiting up to $TimeoutSec s..." }
+            default {
+                Write-Log -Level STEP "Starting service '$Name'..."
+                try { $svc.Start() }
+                catch {
+                    # It may have started in the meantime; only a real failure is an error.
+                    $svc.Refresh()
+                    if ("$($svc.Status)" -notin 'StartPending', 'Running') { throw }
+                }
+            }
+        }
+        if (-not (Wait-ServiceStatus -Service $svc -Status 'Running' -TimeoutSec $TimeoutSec)) {
+            throw "still '$($svc.Status)' after $TimeoutSec s"
         }
         Write-Log -Level OK "Service '$Name' running"
         $true
     } catch {
-        Write-Log -Level WARN "Could not start service '$Name': $($_.Exception.Message)"
+        $msg = $_.Exception.Message
+        if ($_.Exception.InnerException) { $msg += " ($($_.Exception.InnerException.Message))" }
+        Write-Log -Level WARN "Could not start service '$Name': $msg"
         $false
     }
 }

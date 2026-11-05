@@ -87,6 +87,7 @@ try {
     $script:allowClose = $false
     $script:pageReady = $false
     $script:finalRunId = $null
+    $script:installerGoneAt = $null
     $script:finalSeenAt = $null
     $script:lastJson = $null
 
@@ -147,8 +148,9 @@ try {
             'Failed'         { $p.ErrorText = 'Installed versions do not match the package (1 mismatch(es)). Nothing was changed.' }
             'RolledBack'     { $p.ErrorText = 'Update failed; previous version restored.' }
             'RollbackFailed' { $p.ErrorText = 'Update failed and rollback failed. Restore manually from C:\TwinCAT_UpdateBackups\20261105_101500_before_update' }
-            'StartFailed'    { $p.ErrorText = 'The update was installed, but TwinCAT or the HMI Server did not start again. Restart the controller.' }
+            'StartFailed'    { $p.ErrorText = 'The update was installed, but TwinCAT or the HMI Server did not start again. Restarting the controller.' }
         }
+        if ($DemoResult -eq 'StartFailed') { $p.RebootAtUtc = $script:uiStart.AddSeconds($done + 15).ToString('o') }
         [pscustomobject]$p
     }
 
@@ -182,6 +184,13 @@ try {
             $script:finalRunId = $null
             if ($updated) { $vm.StaleSec = [Math]::Max(0, [int]($now - $updated).TotalSeconds) }
             if ($vm.StaleSec -ge $StaleCloseSec) { $vm.CanClose = $true }
+            # Safety net: the update process has ended without its result reaching the file
+            # (killed, or the last write was lost) - go back to the HMI instead of waiting.
+            if (-not $Demo -and $p.Pid) {
+                if (Get-Process -Id ([int]$p.Pid) -ErrorAction SilentlyContinue) { $script:installerGoneAt = $null }
+                elseif (-not $script:installerGoneAt) { $script:installerGoneAt = $now }
+                elseif (($now - $script:installerGoneAt).TotalSeconds -ge 10) { $vm.AutoCloseInSec = 0 }
+            }
             return $vm
         }
 
